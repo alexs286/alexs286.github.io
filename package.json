@@ -1,0 +1,13 @@
+{
+  "name": "alexs286-github-io",
+  "version": "1.0.0",
+  "dependencies": {
+    "firebase-admin": "^12.5.0",
+    "@supabase/supabase-js": "^2.45.4",
+    "cheerio": "^1.0.0-rc.12",
+    "bcryptjs": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=24.x"
+  }
+}
