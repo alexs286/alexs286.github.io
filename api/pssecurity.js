@@ -1,6 +1,6 @@
 const crypto=require("crypto");
 
-const SESSION_COOKIE="__Host-futorion_session";
+const SESSION_COOKIE="__Host-privatepage_session";
 const SESSION_TTL_MS=1000*60*60*6;
 const BODY_MAX=2048;
 const RATE_WINDOW_MS=60*1000;
@@ -12,6 +12,10 @@ const MAX_DELAY_MS=5000;
 const ipState=new Map();
 
 function setSecurityHeaders(res){
+  res.setHeader("Access-Control-Allow-Origin","*");
+  res.setHeader("Access-Control-Allow-Methods","GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers","Content-Type");
+  res.setHeader("Access-Control-Allow-Credentials","true");
   res.setHeader("X-Frame-Options","DENY");
   res.setHeader("X-Content-Type-Options","nosniff");
   res.setHeader("Referrer-Policy","no-referrer");
@@ -141,22 +145,31 @@ function readBody(req,limit){
 
 module.exports=async function handler(req,res){
   setSecurityHeaders(res);
+
+  if(req.method==="OPTIONS"){
+    return res.status(204).end();
+  }
+
   const secret=deriveSecret();
   if(!secret){
     return json(res,500,{error:"Server non configurato"});
   }
+
   const ip=getClientIp(req);
   const state=getState(ip);
   state.requests.push(Date.now());
+
   if(shouldRateLimit(state)){
     res.setHeader("Retry-After","60");
     return json(res,429,{error:"Troppi tentativi, riprova dopo"});
   }
+
   if(req.method==="POST"){
     const ctype=String(req.headers["content-type"]||"").toLowerCase();
     if(!ctype.startsWith("application/json")){
       return json(res,415,{error:"Content-Type non supportato"});
     }
+
     let bodyText="";
     try{
       bodyText=await readBody(req,BODY_MAX);
@@ -164,18 +177,22 @@ module.exports=async function handler(req,res){
       if(e.message==="too_large")return json(res,413,{error:"Payload troppo grande"});
       return json(res,400,{error:"Body non valido"});
     }
+
     let body;
     try{
       body=JSON.parse(bodyText||"{}");
     }catch(e){
       return json(res,400,{error:"JSON non valido"});
     }
+
     const password=typeof body.password==="string"?body.password.trim():"";
     if(password.length<4||password.length>256){
       return json(res,400,{error:"Password non valida"});
     }
+
     const expected=String(process.env.PS_PAGE||"");
     const ok=expected&&safeEqualText(password,expected);
+
     if(!ok){
       state.fails.push(Date.now());
       state.lastFailAt=Date.now();
@@ -183,25 +200,33 @@ module.exports=async function handler(req,res){
       await wait(delay);
       return json(res,401,{error:"Credenziali errate"});
     }
+
     state.fails=[];
+
     const token=makeSessionToken(secret,ip);
     const cookieParts=[`${SESSION_COOKIE}=${token}`,"Path=/","HttpOnly","Secure","SameSite=Strict",`Max-Age=${Math.floor(SESSION_TTL_MS/1000)}`];
+
     res.setHeader("Set-Cookie",cookieParts.join("; "));
     return json(res,200,{ok:true});
   }
+
   if(req.method==="GET"){
     const cookies=parseCookies(req);
     const token=cookies[SESSION_COOKIE];
     const valid=verifySession(token,secret,ip);
+
     if(!valid){
       return json(res,401,{error:"Sessione non valida"});
     }
+
     const content=String(process.env.PR_PAGE||"");
     if(!content){
       return json(res,500,{error:"Contenuto non configurato"});
     }
+
     return json(res,200,{content});
   }
+
   res.setHeader("Allow","GET, POST");
   return json(res,405,{error:"Metodo non consentito"});
 };
