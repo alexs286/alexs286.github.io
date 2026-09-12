@@ -204,7 +204,7 @@ module.exports=async function handler(req,res){
     state.fails=[];
 
     const token=makeSessionToken(secret,ip);
-    const cookieParts=[`${SESSION_COOKIE}=${token}`,"Path=/","HttpOnly","Secure","SameSite=Strict",`Max-Age=${Math.floor(SESSION_TTL_MS/1000)}`];
+    const cookieParts=[`${SESSION_COOKIE}=${token}`,"Path=/","HttpOnly","Secure","SameSite=None",`Max-Age=${Math.floor(SESSION_TTL_MS/1000)}`];
 
     res.setHeader("Set-Cookie",cookieParts.join("; "));
     return json(res,200,{ok:true});
