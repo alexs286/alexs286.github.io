@@ -22,11 +22,8 @@ export default async function handler(req, res) {
     let schema="";
     let task="";
     const guard=`Regole obbligatorie:
-- Il risultato del sito deve essere un UNICO file index.html con HTML, CSS e JS nello stesso file.
-- CSS mezzo compatto: leggibile ma non spezzato inutilmente.
-- ZERO commenti nel codice.
-- Non rimuovere né sostituire funzioni esistenti solo per aggiungerne altre.
-- Preferisci aggiunte locali e modulari, con funzioni JavaScript nominate.
+- CSS mezzo compatto
+- ZERO commenti
 - Quando devi migliorare una funzione esistente, restituisci la funzione migliorata con lo stesso identico nome.
 - Mantieni compatibilità con ciò che esiste già.
 - Evita dipendenze esterne salvo necessità reale.
