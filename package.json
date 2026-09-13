@@ -5,7 +5,7 @@
     "firebase-admin": "^12.5.0",
     "@supabase/supabase-js": "^2.45.4",
     "cheerio": "^1.0.0-rc.12",
-    "bcryptjs": "^3.0.1"
+    "bcryptjs": "^3.0.1",
     "@google/generative-ai": "^0.24.1"
   },
   "engines": {
