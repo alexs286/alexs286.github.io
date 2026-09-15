@@ -5,117 +5,211 @@ const allowedOrigins=["https://www.alexs286.github.io","https://alexs286.github.
 const origin=req.headers.origin;
 if(allowedOrigins.includes(origin))res.setHeader("Access-Control-Allow-Origin",origin);
 res.setHeader("Vary","Origin");
-res.setHeader("Access-Control-Allow-Methods","POST, OPTIONS");
+res.setHeader("Access-Control-Allow-Methods","POST,OPTIONS");
 res.setHeader("Access-Control-Allow-Headers","Content-Type");
 if(req.method==="OPTIONS")return res.status(204).end();
 if(req.method!=="POST")return res.status(405).json({error:"Method not allowed"});
+
 const apiKey=process.env.GEMINI_API_KEY;
 if(!apiKey)return res.status(500).json({error:"GEMINI_API_KEY non configurata sul server"});
 
 try{
 const body=req.body||{};
-const modelName=body.model||"gemini-3.1-flash-lite";
-const genAI=new GoogleGenerativeAI(apiKey);
-const model=genAI.getGenerativeModel({
-model:modelName,
-generationConfig:{responseMimeType:"application/json",temperature:.2,maxOutputTokens:12000}
-});
+const {
+type="analyze",
+mode="fix-and-improve",
+idea="",
+code="",
+directives="",
+api="",
+features=[],
+issues=[],
+previousCode="",
+round=1,
+constraints={},
+prompt="",
+model="gemini-3.1-flash-lite"
+}=body;
 
-const {type,mode,idea,code,directives,problems,previousCode,constraints,chunkIndex,totalChunks,prompt}=body;
+const genAI=new GoogleGenerativeAI(apiKey);
+const selectedModel=model||"gemini-3.1-flash-lite";
 
 const guard=`Regole obbligatorie:
-- CSS mezzo compatto
-- ZERO commenti
-- Non eliminare funzioni esistenti senza una ragione tecnica indispensabile
-- Non sostituire una funzione esistente con una funzione diversa
-- Mantieni tutti i comportamenti e le funzionalità già presenti
-- Quando modifichi una funzione mantieni esattamente lo stesso nome
-- Non rimuovere event listener, elementi DOM, API, variabili o dipendenze funzionanti
-- Preferisci correzioni minime e conservative
-- Non introdurre dipendenze esterne se non indispensabili
-- Non inserire API key o segreti nel codice frontend
-- Se una funzione richiede server-side, segnala apiNeeded e apiNotes
-- Il codice restituito deve essere completo e direttamente utilizzabile`;
+- CSS mezzo compatto.
+- ZERO commenti nel codice.
+- Quando migliori una funzione esistente mantieni esattamente lo stesso nome.
+- Mantieni compatibilità con il codice già esistente.
+- Non eliminare funzionalità funzionanti senza una ragione tecnica.
+- Non aggiungere dipendenze esterne se non sono realmente necessarie.
+- Non inserire chiavi API, password, token o segreti nel frontend.
+- Se una funzionalità richiede server-side, restituisci una soluzione compatibile con un endpoint separato.
+- Restituisci codice completo quando viene richiesto.
+- Non usare markdown nel JSON.
+- Non inventare API inesistenti.
+- Individua anche problemi introdotti durante un precedente miglioramento.`;
 
 let task="";
 let schema="";
 
 if(type==="analyze"){
-task=`Analizza il codice esclusivamente per trovare problemi reali.
-Non riscrivere il codice.
-Individua problemi gravi che possono rompere il sito o funzionalità fondamentali, problemi medi che compromettono singole funzioni senza rompere tutto e problemi bassi che non rompono codice o funzioni ma rappresentano difetti o miglioramenti tecnici.
-Restituisci da 1 a 20 problemi concreti.
-Ogni problema deve avere title,detail,severity.
-severity deve essere esclusivamente high,medium oppure low.
-Se il codice è un chunk ${chunkIndex+1||1} di ${totalChunks||1}, considera solo ciò che puoi dimostrare dal chunk.
+task=`Analizza rigorosamente il progetto senza modificarlo.
+
+Devi individuare:
+1. problemi GRAVI: errori che possono rompere il progetto, impedire l'avvio, rompere parti importanti o creare malfunzionamenti strutturali;
+2. problemi MEDI: problemi che rompono una singola funzione, comportamento o parte specifica;
+3. problemi NON-GRAVI: warning, codice morto, ridondanze, qualità, piccole inefficienze o codice spazzatura.
+
+Devi inoltre proporre da 5 a 12 funzioni, miglioramenti o suggerimenti concretamente applicabili.
+
 ${guard}
-Modalità:${mode||"diagnostic"}
-Richiesta:${idea||""}
+
+Modalità:
+${mode}
+
+Idea:
+${idea}
+
 Codice:
-${code||""}`;
-schema=`{"issues":[{"title":"Problema","detail":"Spiegazione","severity":"high"}],"summary":"Sintesi"}`;
+${code}
 
-}else if(type==="apply"){
-task=`Correggi il codice usando esclusivamente i problemi forniti.
-Devi preservare tutte le funzioni già presenti.
-Non riscrivere parti non necessarie.
-Non eliminare funzionalità per risolvere problemi.
-Prima confronta mentalmente codice precedente e codice corretto e assicurati che le funzioni esistenti siano ancora presenti.
-Restituisci il codice completo.
+Direttive:
+${directives}
+
+Informazioni API:
+${api}`;
+
+schema=`{
+"issues":[
+{"name":"Nome","level":"grave","detail":"Descrizione tecnica precisa"},
+{"name":"Nome","level":"medio","detail":"Descrizione tecnica precisa"},
+{"name":"Nome","level":"non-grave","detail":"Descrizione tecnica precisa"}
+],
+"features":[
+{"name":"Nome funzione","detail":"Descrizione concreta"}
+],
+"summary":"Sintesi tecnica"
+}`;
+
+}else if(type==="generate"||type==="regenerate"){
+task=`Genera il codice completo aggiornato.
+
+Devi eseguire questo processo:
+1. analizza il codice;
+2. risolvi i problemi selezionati;
+3. migliora il codice;
+4. aggiungi le funzioni selezionate;
+5. controlla che il risultato non introduca problemi;
+6. restituisci l'intero codice aggiornato.
+
 ${guard}
-Problemi:
-${JSON.stringify(problems||[])}
+
+Idea:
+${idea}
+
+Direttive:
+${directives}
+
+Informazioni API:
+${api}
+
+Problemi selezionati:
+${JSON.stringify(issues)}
+
+Funzioni e suggerimenti selezionati:
+${JSON.stringify(features)}
+
 Codice precedente:
-${previousCode||code||""}
-Codice da correggere:
-${code||""}
-Richiesta:
-${directives||idea||""}`;
-schema=`{"code":"<!doctype html>","summary":"Modifiche effettuate","apiNeeded":false,"apiNotes":"","preservedFunctions":[]}`;
+${previousCode||code}
 
-}else if(type==="verify"){
-task=`Verifica il codice aggiornato rispetto ai problemi precedentemente rilevati.
-Per ogni problema indica se è stato risolto.
-resolved deve essere true se è stato risolto, false se persiste.
-fixed può essere usato come sinonimo di resolved.
-Se un problema non esiste più ma non puoi dimostrare con certezza che sia stato risolto, usa severity low e descrivilo.
-Non modificare il codice.
+Round:
+${round}
+
+Vincoli:
+${JSON.stringify(constraints)}
+
+Istruzioni aggiuntive:
+${prompt}`;
+
+schema=`{
+"code":"<!doctype html>...",
+"summary":"Descrizione delle modifiche",
+"apiNeeded":false,
+"apiNotes":"",
+"remainingSevereProblems":[]
+}`;
+
+}else if(type==="auto"){
+task=`Esegui un singolo passaggio di auto-evoluzione.
+
+Analizza il codice attuale, trova una miglioria utile e non distruttiva, applicala e restituisci il risultato secondo la struttura richiesta.
+
 ${guard}
-Problemi precedenti:
-${JSON.stringify(problems||[])}
-Codice aggiornato:
-${code||""}`;
-schema=`{"results":[{"title":"Problema","detail":"Risultato verifica","severity":"low","resolved":true}],"summary":"Sintesi verifica"}`;
+
+Codice:
+${code}
+
+Round:
+${round}
+
+Direttive:
+${directives}`;
+
+schema=`{
+"patch":{
+"functions":[{"name":"nomeFunzione","code":"function nomeFunzione(){}"}],
+"insertions":[{"marker":"</body>","code":"<script></script>","newline":true}]
+},
+"summary":"Miglioria",
+"continue":true
+}`;
 
 }else{
 return res.status(400).json({error:"Tipo di richiesta non valido"});
 }
 
-const result=await model.generateContent(`${task}
-${prompt||""}
+const generationConfig={
+responseMimeType:"application/json",
+temperature:type==="analyze"?0.2:0.3,
+maxOutputTokens:30000
+};
 
-Rispondi con UN SOLO oggetto JSON.
-Non usare markdown.
-Non usare blocchi.
-Rispetta esattamente la struttura:
-${schema}`);
+const modelInstance=genAI.getGenerativeModel({
+model:selectedModel,
+generationConfig
+});
 
-const text=result.response.text().trim();
+const finalPrompt=`${task}
+
+${prompt}
+
+Rispondi con UN SOLO oggetto JSON valido.
+Non aggiungere testo prima o dopo il JSON.
+Segui esattamente questa struttura:
+
+${schema}`;
+
+const result=await modelInstance.generateContent(finalPrompt);
+let text=result.response.text().trim();
+
+text=text.replace(/^```json\s*/i,"").replace(/^```\s*/i,"").replace(/\s*```$/,"").trim();
 
 let json;
+
 try{
 json=JSON.parse(text);
-}catch{
+}catch(error){
 return res.status(502).json({
 error:"Gemini ha restituito un JSON non valido",
 details:text,
-model:modelName
+parseError:error.message
 });
 }
 
 return res.status(200).json(json);
 
 }catch(error){
-return res.status(500).json({error:error.message||"Errore interno del server"});
+return res.status(500).json({
+error:error.message||"Errore interno del server"
+});
 }
 }
