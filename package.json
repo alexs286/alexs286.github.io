@@ -1,7 +1,6 @@
 {
   "name": "alexs286-github-io",
   "version": "1.0.0",
-  "type": "module",
   "dependencies": {
     "firebase-admin": "^12.5.0",
     "@supabase/supabase-js": "^2.45.4",
