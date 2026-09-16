@@ -71,9 +71,10 @@ export default async function handler(req, res) {
         }
 
         if (req.method === 'POST' && url.includes('dashboard')) {
-            const { action, userId, ...payload } = req.body;
+            const { action, azione, userId, ...payload } = req.body;
+            const currentAction = action || azione;
             
-            if (action === 'update_user') {
+            if (currentAction === 'update_user' || currentAction === 'aggiornamento_utente') {
                 const sUserId = sanitizeInput(userId);
                 if (!sUserId) return res.status(400).json({ error: 'ID utente mancante' });
 
@@ -90,16 +91,16 @@ export default async function handler(req, res) {
         }
 
         if (req.method === 'POST' && url.includes('servizio')) {
-            const { status, message, version } = req.body;
+            const { status, stato, message, messaggio, version, versione } = req.body;
             
             const cleanPayload = {
-                status: sanitizeInput(status),
-                message: sanitizeInput(message),
-                version: sanitizeInput(version),
+                status: sanitizeInput(status || stato),
+                message: sanitizeInput(message || messaggio),
+                version: sanitizeInput(version || versione),
                 ultimo_aggiornamento: admin.firestore.FieldValue.serverTimestamp()
             };
 
-            await db.collection('configurazione_sistema').doc('stato_servizio').set(cleanPayload, { merge: true });
+            await db.collection('stato del servizio').doc('current_status').set(cleanPayload, { merge: true });
             return res.status(200).json({ success: true, message: 'Stato servizio aggiornato' });
         }
 
