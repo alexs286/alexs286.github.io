@@ -12,7 +12,7 @@ const MAX_DELAY_MS=5000;
 const ipState=new Map();
 
 function setSecurityHeaders(res){
-  res.setHeader("Access-Control-Allow-Origin","https://alexs286.github.io","https://www.alexs286.github.io");
+  res.setHeader("Access-Control-Allow-Origin","https://alexs286.github.io");
   res.setHeader("Access-Control-Allow-Methods","GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers","Content-Type");
   res.setHeader("Access-Control-Allow-Credentials","true");
