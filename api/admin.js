@@ -56,9 +56,12 @@ export default async function handler(req, res) {
             const collectionName = sanitize(body.collection);
             if (!collectionName) return res.status(400).json({ error: 'Collezione mancante' });
 
-            const snapshot = await db.collection(collectionName).orderBy('data', 'desc').limit(100).get().catch(async () => {
-                return await db.collection(collectionName).limit(100).get();
-            });
+            let snapshot;
+            try {
+                snapshot = await db.collection(collectionName).orderBy('data', 'desc').limit(100).get();
+            } catch (err) {
+                snapshot = await db.collection(collectionName).limit(100).get();
+            }
 
             const docs = [];
             snapshot.forEach(doc => docs.push({ id: doc.id, data: doc.data() }));
