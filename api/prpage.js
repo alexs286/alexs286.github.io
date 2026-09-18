@@ -6,30 +6,21 @@ if (!admin.apps.length) {
         admin.initializeApp({
             credential: admin.credential.cert(serviceAccount)
         });
-    } catch (e) {
-        console.error("Errore inizializzazione Firebase:", e);
-    }
+    } catch (e) {}
 }
 
 const db = admin.firestore();
 const rateLimits = new Map();
 
-const sanitizeInput = (input) => {
-    if (typeof input !== 'string') return '';
-    return input.trim().substring(0, 1000).replace(/[<>]/g, '');
-};
+const sanitize = (i) => typeof i === 'string' ? i.trim().substring(0, 1000).replace(/[<>]/g, '') : '';
 
 const checkRateLimit = (ip) => {
     const now = Date.now();
     const limit = rateLimits.get(ip) || { count: 0, time: now };
-    if (now - limit.time > 60000) {
-        limit.count = 1;
-        limit.time = now;
-    } else {
-        limit.count++;
-    }
+    if (now - limit.time > 60000) { limit.count = 1; limit.time = now; } 
+    else { limit.count++; }
     rateLimits.set(ip, limit);
-    return limit.count > 30; 
+    return limit.count > 50; 
 };
 
 export default async function handler(req, res) {
@@ -40,73 +31,44 @@ export default async function handler(req, res) {
     if (req.method === 'OPTIONS') return res.status(200).end();
 
     const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-    if (checkRateLimit(clientIp)) {
-        return res.status(429).json({ error: 'Troppe richieste. Riprova più tardi.' });
-    }
+    if (checkRateLimit(clientIp)) return res.status(429).json({ error: 'Rate limit' });
 
     try {
-        const url = req.url || '';
+        const action = req.query.action || (req.body && req.body.action);
 
-        if (req.method === 'GET' && url.includes('richieste')) {
-            const snapshot = await db.collection('richieste_supporto')
-                .orderBy('data', 'desc')
-                .limit(50)
-                .get();
-            
-            const richieste = [];
-            snapshot.forEach(doc => {
-                richieste.push({ id: doc.id, ...doc.data() });
-            });
-            return res.status(200).json(richieste);
+        if (req.method === 'GET' && action === 'get_status') {
+            const doc = await db.collection('stato del servizio').doc('current_status').get();
+            return res.status(200).json(doc.exists ? doc.data() : { status: 'online' });
         }
 
-        if (req.method === 'GET' && url.includes('dashboard')) {
-            const userId = sanitizeInput(req.query.userId);
-            if (!userId) return res.status(400).json({ error: 'ID utente mancante' });
-
-            const doc = await db.collection('utenti_dashboard').doc(userId).get();
-            if (!doc.exists) return res.status(404).json({ error: 'Utente non trovato' });
-
-            return res.status(200).json(doc.data());
+        if (req.method === 'GET' && action === 'get_richieste') {
+            const snap = await db.collection('richieste_supporto').orderBy('data', 'desc').limit(50).get();
+            const r = [];
+            snap.forEach(d => r.push({ id: d.id, ...d.data() }));
+            return res.status(200).json(r);
         }
 
-        if (req.method === 'POST' && url.includes('dashboard')) {
-            const { action, azione, userId, ...payload } = req.body;
-            const currentAction = action || azione;
-            
-            if (currentAction === 'update_user' || currentAction === 'aggiornamento_utente') {
-                const sUserId = sanitizeInput(userId);
-                if (!sUserId) return res.status(400).json({ error: 'ID utente mancante' });
-
-                const cleanPayload = {};
-                for (const [key, value] of Object.entries(payload)) {
-                    cleanPayload[key] = sanitizeInput(value);
-                }
-                
-                cleanPayload.ultimo_aggiornamento = admin.firestore.FieldValue.serverTimestamp();
-
-                await db.collection('utenti_dashboard').doc(sUserId).set(cleanPayload, { merge: true });
-                return res.status(200).json({ success: true, message: 'Dati utente aggiornati' });
-            }
+        if (req.method === 'POST' && action === 'login') {
+            const { email, password } = req.body;
+            const snap = await db.collection('utenti_dashboard').where('email', '==', String(email)).where('password', '==', String(password)).limit(1).get();
+            if (snap.empty) return res.status(401).json({ error: 'Non autorizzato' });
+            return res.status(200).json({ userId: snap.docs[0].id });
         }
 
-        if (req.method === 'POST' && url.includes('servizio')) {
-            const { status, stato, message, messaggio, version, versione } = req.body;
-            
-            const cleanPayload = {
-                status: sanitizeInput(status || stato),
-                message: sanitizeInput(message || messaggio),
-                version: sanitizeInput(version || versione),
+        if (req.method === 'POST' && action === 'update_status') {
+            const { stato, messaggio, versione } = req.body;
+            const payload = {
+                status: sanitize(stato),
+                message: sanitize(messaggio),
+                version: sanitize(versione),
                 ultimo_aggiornamento: admin.firestore.FieldValue.serverTimestamp()
             };
-
-            await db.collection('stato del servizio').doc('current_status').set(cleanPayload, { merge: true });
-            return res.status(200).json({ success: true, message: 'Stato servizio aggiornato' });
+            await db.collection('stato del servizio').doc('current_status').set(payload, { merge: true });
+            return res.status(200).json({ success: true });
         }
 
-        return res.status(404).json({ error: 'Endpoint non riconosciuto' });
+        return res.status(404).json({ error: 'Azione non trovata' });
     } catch (error) {
-        console.error('API Error:', error);
-        return res.status(500).json({ error: 'Errore interno del server' });
+        return res.status(500).json({ error: 'Errore server' });
     }
 }
