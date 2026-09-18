@@ -89,19 +89,35 @@ export default async function handler(req, res) {
 
         if (action === 'create_user') {
             const collectionName = sanitize(body.collection || 'utenti_dashboard');
-            const { email, password, nome, ruolo } = body.data || {};
+            const userData = body.data || {};
 
-            if (!email || !password) return res.status(400).json({ error: 'Email e password obbligatorie' });
+            if (!userData.email || !userData.password) return res.status(400).json({ error: 'Email e password obbligatorie' });
 
-            const userRef = await db.collection(collectionName).add({
-                email: sanitize(email),
-                password: sanitize(password),
-                nome: sanitize(nome || ''),
-                ruolo: sanitize(ruolo || 'cliente'),
-                data: admin.firestore.FieldValue.serverTimestamp()
-            });
+            const cleanData = {};
+            for (const [k, v] of Object.entries(userData)) {
+                cleanData[k] = sanitize(v);
+            }
+            cleanData.data = admin.firestore.FieldValue.serverTimestamp();
 
+            const userRef = await db.collection(collectionName).add(cleanData);
             return res.status(200).json({ success: true, id: userRef.id });
+        }
+
+        if (action === 'update_user') {
+            const collectionName = sanitize(body.collection || 'utenti_dashboard');
+            const userId = sanitize(body.userId);
+            const userData = body.data || {};
+
+            if (!userId) return res.status(400).json({ error: 'ID utente mancante' });
+
+            const cleanData = {};
+            for (const [k, v] of Object.entries(userData)) {
+                cleanData[k] = sanitize(v);
+            }
+            cleanData.ultimo_aggiornamento = admin.firestore.FieldValue.serverTimestamp();
+
+            await db.collection(collectionName).doc(userId).set(cleanData, { merge: true });
+            return res.status(200).json({ success: true });
         }
 
         if (action === 'update_status') {
