@@ -15,8 +15,8 @@ function setSecurityHeaders(req, res) {
   const origin = String(req.headers.origin || "");
 
   if (
-    origin === "https://alexs286.github.io" ||
-    origin === "https://www.alexs286.github.io"
+    origin === "https://creatorweb.cc" ||
+    origin === "https://www.creatorweb.cc"
   ) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
