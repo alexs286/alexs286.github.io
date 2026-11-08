@@ -309,6 +309,7 @@ module.exports = async function handler(req, res) {
             const privateData = {};
             const apiToken = typeof data.apitoken_cf === 'string' ? data.apitoken_cf.trim() : '';
             const accountId = typeof data.accid_cf === 'string' ? data.accid_cf.trim() : '';
+            const zoneId = typeof data.zone_id === 'string' ? data.zone_id.trim() : '';
 
             if (data.clear_apitoken_cf === true) {
                 privateData.apitoken_cf = admin.firestore.FieldValue.delete();
@@ -320,6 +321,12 @@ module.exports = async function handler(req, res) {
                 privateData.accid_cf = admin.firestore.FieldValue.delete();
             } else if (accountId) {
                 privateData.accid_cf = accountId;
+            }
+
+            if (data.clear_zone_id === true) {
+                privateData.zone_id = admin.firestore.FieldValue.delete();
+            } else if (zoneId) {
+                privateData.zone_id = zoneId;
             }
 
             if (Object.keys(privateData).length === 0) {
