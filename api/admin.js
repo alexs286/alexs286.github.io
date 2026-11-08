@@ -306,34 +306,39 @@ module.exports = async function handler(req, res) {
                 return sendJson(res, 400, { error: 'ID utente non valido' });
             }
 
-            const privateData = {};
             const apiToken = typeof data.apitoken_cf === 'string' ? data.apitoken_cf.trim() : '';
             const accountId = typeof data.accid_cf === 'string' ? data.accid_cf.trim() : '';
             const zoneId = typeof data.zone_id === 'string' ? data.zone_id.trim() : '';
+            const hasChanges = Boolean(
+                apiToken || accountId || zoneId ||
+                data.clear_apitoken_cf === true ||
+                data.clear_accid_cf === true ||
+                data.clear_zone_id === true
+            );
 
-            if (data.clear_apitoken_cf === true) {
-                privateData.apitoken_cf = admin.firestore.FieldValue.delete();
-            } else if (apiToken) {
-                privateData.apitoken_cf = apiToken;
-            }
-
-            if (data.clear_accid_cf === true) {
-                privateData.accid_cf = admin.firestore.FieldValue.delete();
-            } else if (accountId) {
-                privateData.accid_cf = accountId;
-            }
-
-            if (data.clear_zone_id === true) {
-                privateData.zone_id = admin.firestore.FieldValue.delete();
-            } else if (zoneId) {
-                privateData.zone_id = zoneId;
-            }
-
-            if (Object.keys(privateData).length === 0) {
+            if (!hasChanges) {
                 return sendJson(res, 400, { error: 'Nessuna modifica Cloudflare da salvare' });
             }
 
-            await db.collection('users').doc(userId).set(privateData, { merge: true });
+            const userRef = db.collection('users').doc(userId);
+            const snap = await userRef.get();
+            const existing = snap.exists ? (snap.data() || {}) : {};
+            const cloudflare = { ...(existing.cloudflare || {}) };
+
+            if (!cloudflare.api_token && existing.apitoken_cf) cloudflare.api_token = existing.apitoken_cf;
+            if (!cloudflare.account_id && existing.accid_cf) cloudflare.account_id = existing.accid_cf;
+            if (!cloudflare.zone_id && existing.zone_id) cloudflare.zone_id = existing.zone_id;
+
+            if (data.clear_apitoken_cf === true) delete cloudflare.api_token;
+            else if (apiToken) cloudflare.api_token = apiToken;
+
+            if (data.clear_accid_cf === true) delete cloudflare.account_id;
+            else if (accountId) cloudflare.account_id = accountId;
+
+            if (data.clear_zone_id === true) delete cloudflare.zone_id;
+            else if (zoneId) cloudflare.zone_id = zoneId;
+
+            await userRef.set({ cloudflare }, { merge: true });
             return sendJson(res, 200, { success: true });
         }
 
