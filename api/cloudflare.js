@@ -752,18 +752,19 @@ module.exports = async (req, res) => {
             error: "Unknown action"
         });
 
-    } catch (error) {
-        console.error(
-            "Cloudflare API error:",
-            error.message
-        );
 
+    } catch (error) {
+        console.error("Cloudflare API error:", {
+            message: error.message,
+            stack: error.stack
+        });
+    
         return sendJson(res, 502, {
             success: false,
-
             error: action === "stats"
                 ? "Unable to retrieve Cloudflare statistics"
-                : "Unable to check website availability"
+                : "Unable to check website availability",
+            details: error.message
         });
     }
 };
