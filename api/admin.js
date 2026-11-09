@@ -35,7 +35,6 @@ const ALLOWED_COLLECTIONS = new Set([
 
 const USER_FIELDS = new Set([
     'email',
-    'password',
     'nome',
     'nome_utente',
     'cognome',
@@ -149,6 +148,17 @@ function serializeData(value) {
     return value;
 }
 
+function redactSensitiveFields(value) {
+    if (Array.isArray(value)) return value.map(redactSensitiveFields);
+    if (!value || typeof value !== 'object') return value;
+    const result = {};
+    for (const [key, child] of Object.entries(value)) {
+        if (['password', 'passwordHash', 'codici_sicurezza_hash'].includes(key)) continue;
+        result[key] = redactSensitiveFields(child);
+    }
+    return result;
+}
+
 async function verifyAdmin(req) {
     const header = req.headers.authorization || '';
     const match = header.match(/^Bearer\s+(.+)$/i);
@@ -172,7 +182,7 @@ async function verifyAdmin(req) {
 
     let decoded;
     try {
-        decoded = await admin.auth().verifyIdToken(match[1]);
+        decoded = await admin.auth().verifyIdToken(match[1], true);
     } catch (_error) {
         const error = new Error('Sessione non valida o scaduta.');
         error.status = 401;
@@ -195,7 +205,7 @@ function pickUserFields(source, creating = false) {
     for (const [key, value] of Object.entries(source)) {
         if (!USER_FIELDS.has(key)) continue;
         if (typeof value === 'string') {
-            result[key] = cleanString(value, key === 'password' ? 200 : 2000);
+            result[key] = cleanString(value, 2000);
         } else if (value === null && !creating) {
             result[key] = null;
         }
@@ -253,7 +263,7 @@ module.exports = async function handler(req, res) {
             const snapshot = await db.collection(collectionName).get();
             const docs = snapshot.docs.map(doc => ({
                 id: doc.id,
-                data: serializeData(doc.data())
+                data: redactSensitiveFields(serializeData(doc.data()))
             }));
 
             docs.sort((a, b) => {
@@ -273,93 +283,190 @@ module.exports = async function handler(req, res) {
         }
 
         if (action === 'create_user') {
-            const collectionName = cleanString(
-                body.collection || 'utenti_dashboard',
-                100
-            );
-
+            const collectionName = cleanString(body.collection || 'utenti_dashboard', 100);
             if (collectionName !== 'utenti_dashboard') {
-                return sendJson(res, 403, {
-                    error: 'Collezione non autorizzata'
-                });
+                return sendJson(res, 403, { error: 'Collezione non autorizzata' });
             }
 
+            const uid = cleanString(body.uid, 150);
+            if (!validDocumentId(uid)) {
+                return sendJson(res, 400, { error: 'Inserisci un UID Firebase Authentication valido.' });
+            }
+
+            let authUser;
+            try {
+                authUser = await admin.auth().getUser(uid);
+            } catch (error) {
+                if (error.code === 'auth/user-not-found') {
+                    return sendJson(res, 404, { error: 'UID non trovato in Firebase Authentication. Crea prima l’account cliente con una password temporanea.' });
+                }
+                throw error;
+            }
+            if (authUser.disabled || !authUser.email) {
+                return sendJson(res, 400, { error: 'L’account Firebase deve essere attivo e avere un indirizzo email.' });
+            }
+
+            const email = authUser.email.trim().toLowerCase();
             const userData = pickUserFields(body.data, true);
+            userData.email = email;
+
+            const legacyUserId = cleanString(body.legacyUserId, 150);
+            if (legacyUserId && !validDocumentId(legacyUserId)) {
+                return sendJson(res, 400, { error: 'ID del vecchio documento non valido.' });
+            }
+            if (legacyUserId && legacyUserId === uid) {
+                return sendJson(res, 400, { error: 'Il vecchio ID deve essere diverso dal nuovo UID.' });
+            }
 
             const recoveryCodes = Array.isArray(body.recoveryCodes)
-                ? body.recoveryCodes.map(code =>
-                    cleanString(code, 30)
-                        .replace(/[\s-]/g, '')
-                        .toUpperCase()
-                )
+                ? body.recoveryCodes.map(code => cleanString(code, 30).replace(/[\s-]/g, '').toUpperCase())
                 : [];
-
-            if (
-                !userData.email ||
-                !userData.password ||
-                !userData.nome_utente
-            ) {
-                return sendJson(res, 400, {
-                    error: 'Email, password e nome utente sono obbligatori'
-                });
-            }
-
             if (
                 recoveryCodes.length !== 8 ||
                 new Set(recoveryCodes).size !== 8 ||
                 recoveryCodes.some(code => !/^[A-F0-9]{12}$/.test(code))
             ) {
-                return sendJson(res, 400, {
-                    error: 'Devi generare esattamente 8 codici validi e distinti'
-                });
+                return sendJson(res, 400, { error: 'Devi generare esattamente 8 codici di sicurezza validi e distinti.' });
             }
 
+            const userRef = db.collection('utenti_dashboard').doc(uid);
+            const existingUidDoc = await userRef.get();
+            if (existingUidDoc.exists) {
+                return sendJson(res, 409, { error: 'Esiste già un profilo CreatorWeb associato a questo UID.' });
+            }
+
+            let legacySnapshot = null;
+            if (legacyUserId) {
+                legacySnapshot = await db.collection('utenti_dashboard').doc(legacyUserId).get();
+                if (!legacySnapshot.exists) {
+                    return sendJson(res, 404, { error: 'Il vecchio documento indicato non esiste in utenti_dashboard.' });
+                }
+                const legacyRecord = legacySnapshot.data() || {};
+                if (legacyRecord.migrated_to_uid && legacyRecord.migrated_to_uid !== uid) {
+                    return sendJson(res, 409, { error: `Questo vecchio documento risulta già migrato sull’UID ${legacyRecord.migrated_to_uid}.` });
+                }
+                const legacyEmail = cleanString(legacyRecord.email, 254).toLowerCase();
+                if (legacyEmail && legacyEmail !== email) {
+                    return sendJson(res, 409, { error: 'L’email del vecchio documento non coincide con quella dell’account Firebase.' });
+                }
+            }
+
+            const emailMatches = await db.collection('utenti_dashboard').where('email', '==', email).get();
+            const duplicateEmail = emailMatches.docs.find(doc => doc.id !== legacyUserId && doc.id !== uid);
+            if (duplicateEmail) {
+                return sendJson(res, 409, { error: 'Questa email è presente in un altro profilo. Indica il relativo ID come vecchio documento da migrare.' });
+            }
+
+            if (legacySnapshot?.exists) {
+                const legacyData = pickUserFields(legacySnapshot.data(), true);
+                const requestedName = userData.nome;
+                const requestedUsername = userData.nome_utente;
+                Object.assign(userData, legacyData);
+                userData.nome = requestedName || userData.nome;
+                userData.nome_utente = requestedUsername || userData.nome_utente;
+                userData.email = email;
+            }
+
+            if (!userData.nome_utente) {
+                return sendJson(res, 400, { error: 'Il nome utente è obbligatorio.' });
+            }
+            userData.nome_utente = userData.nome_utente.toLowerCase();
             userData.nome = userData.nome || userData.nome_utente;
-
-            const emailExists = await db
-                .collection('utenti_dashboard')
-                .where('email', '==', userData.email)
-                .limit(1)
-                .get();
-
-            if (!emailExists.empty) {
-                return sendJson(res, 409, {
-                    error: 'Questa email è già associata a un utente'
-                });
-            }
-
-            const usernameExists = await db
-                .collection('utenti_dashboard')
-                .where('nome_utente', '==', userData.nome_utente)
-                .limit(1)
-                .get();
-
-            if (!usernameExists.empty) {
-                return sendJson(res, 409, {
-                    error: 'Questo nome utente è già utilizzato'
-                });
-            }
-
             userData.codici_sicurezza_hash = recoveryCodes.map(code =>
                 crypto.createHash('sha256').update(code).digest('hex')
             );
-
-            userData.codici_sicurezza_generati_il =
-                admin.firestore.FieldValue.serverTimestamp();
-
+            userData.codici_sicurezza_generati_il = admin.firestore.FieldValue.serverTimestamp();
             userData.data = admin.firestore.FieldValue.serverTimestamp();
+            userData.account = {
+                must_change_password: true,
+                created_at: admin.firestore.FieldValue.serverTimestamp()
+            };
+            userData.migrated_from_legacy_id = legacyUserId || null;
 
-            const userRef = await db
-                .collection('utenti_dashboard')
-                .add(userData);
+            const usernameMatches = await db.collection('utenti_dashboard')
+                .where('nome_utente', '==', userData.nome_utente)
+                .get();
+            const duplicateUsername = usernameMatches.docs.find(doc => doc.id !== legacyUserId && doc.id !== uid);
+            if (duplicateUsername) {
+                return sendJson(res, 409, { error: 'Questo nome utente è già utilizzato.' });
+            }
+
+            const batch = db.batch();
+            batch.create(userRef, userData);
+
+            let privateDataCopied = false;
+            if (legacyUserId) {
+                const legacyPrivateRef = db.collection('users').doc(legacyUserId);
+                const legacyPrivateSnapshot = await legacyPrivateRef.get();
+                if (legacyPrivateSnapshot.exists) {
+                    const privateData = legacyPrivateSnapshot.data() || {};
+                    batch.set(db.collection('users').doc(uid), {
+                        ...privateData,
+                        userid: uid,
+                        migrated_from_legacy_id: legacyUserId,
+                        migrated_at: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+                    privateDataCopied = true;
+                }
+                batch.set(db.collection('utenti_dashboard').doc(legacyUserId), {
+                    password: admin.firestore.FieldValue.delete(),
+                    codici_sicurezza_hash: admin.firestore.FieldValue.delete(),
+                    migrated_to_uid: uid,
+                    migrated_at: admin.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
+            }
+
+            await batch.commit();
+
+            const stripeMappingCounts = {};
+            const stripeMappingWarnings = [];
+            let stripeEventCount = 0;
+            if (legacyUserId) {
+                for (const collectionName of ['stripeCustomers', 'stripeSubscriptions', 'stripeAccounts']) {
+                    try {
+                        const mappings = await db.collection(collectionName).where('userid', '==', legacyUserId).get();
+                        stripeMappingCounts[collectionName] = mappings.size;
+                        const writer = db.bulkWriter();
+                        mappings.docs.forEach(mapping => writer.set(mapping.ref, {
+                            userid: uid,
+                            migrated_from_legacy_id: legacyUserId
+                        }, { merge: true }));
+                        await writer.close();
+                    } catch (error) {
+                        console.error(`Migrazione mapping ${collectionName} non riuscita:`, error);
+                        stripeMappingWarnings.push(collectionName);
+                    }
+                }
+
+                try {
+                    const oldEvents = await db.collection('users').doc(legacyUserId)
+                        .collection('stripeEvents').get();
+                    stripeEventCount = oldEvents.size;
+                    const writer = db.bulkWriter();
+                    oldEvents.docs.forEach(eventDoc => writer.set(
+                        db.collection('users').doc(uid).collection('stripeEvents').doc(eventDoc.id),
+                        { ...eventDoc.data(), migrated_from_legacy_id: legacyUserId },
+                        { merge: true }
+                    ));
+                    await writer.close();
+                } catch (error) {
+                    console.error('Migrazione storico eventi Stripe non riuscita:', error);
+                    stripeMappingWarnings.push('users/{legacyId}/stripeEvents');
+                }
+            }
 
             return sendJson(res, 200, {
                 success: true,
-                id: userRef.id,
-                recovery_codes_saved: 8
+                uid,
+                email,
+                recovery_codes_saved: 8,
+                migrated_legacy_profile: Boolean(legacySnapshot?.exists),
+                migrated_private_data: privateDataCopied,
+                migrated_stripe_mappings: stripeMappingCounts,
+                migrated_stripe_events: stripeEventCount,
+                stripe_mapping_warnings: stripeMappingWarnings
             });
         }
-
 
         if (action === 'update_user') {
             const collectionName = cleanString(body.collection || 'utenti_dashboard', 100);
@@ -372,13 +479,29 @@ module.exports = async function handler(req, res) {
                 return sendJson(res, 400, { error: 'ID utente non valido' });
             }
 
+            const userRef = db.collection('utenti_dashboard').doc(userId);
+            const existingProfile = await userRef.get();
+            if (!existingProfile.exists) {
+                return sendJson(res, 404, { error: 'Profilo utente non trovato' });
+            }
+
             const cleanData = pickUserFields(body.data, false);
             if (Object.keys(cleanData).length === 0) {
                 return sendJson(res, 400, { error: 'Nessun campo utente valido da aggiornare' });
             }
 
+            if (typeof cleanData.email === 'string' && cleanData.email) {
+                cleanData.email = cleanData.email.toLowerCase();
+                try {
+                    await admin.auth().getUser(userId);
+                    await admin.auth().updateUser(userId, { email: cleanData.email });
+                } catch (error) {
+                    if (error.code !== 'auth/user-not-found') throw error;
+                }
+            }
+
             cleanData.ultimo_aggiornamento = admin.firestore.FieldValue.serverTimestamp();
-            await db.collection('utenti_dashboard').doc(userId).set(cleanData, { merge: true });
+            await userRef.set(cleanData, { merge: true });
             return sendJson(res, 200, { success: true });
         }
 
