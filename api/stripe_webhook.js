@@ -1,4 +1,3 @@
-
 const Stripe = require("stripe");
 const admin = require("firebase-admin");
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -51,6 +50,15 @@ function cleanObject(obj) {
     return JSON.parse(JSON.stringify(obj));
 }
 
+async function resolveMigratedUserId(userId) {
+    if (typeof userId !== 'string' || !userId) return null;
+    const legacyProfile = await db.collection('utenti_dashboard').doc(userId).get();
+    const migratedUid = legacyProfile.exists
+        ? legacyProfile.data()?.migrated_to_uid
+        : null;
+    return typeof migratedUid === 'string' && migratedUid ? migratedUid : userId;
+}
+
 async function findUserId(event, obj) {
 
     const metadataUserId =
@@ -58,7 +66,7 @@ async function findUserId(event, obj) {
         obj?.metadata?.userId;
 
     if (metadataUserId) {
-        return metadataUserId;
+        return resolveMigratedUserId(metadataUserId);
     }
 
     const accountId = event.account || null;
@@ -70,7 +78,7 @@ async function findUserId(event, obj) {
             .get();
 
         if (doc.exists) {
-            return doc.data().userid;
+            return resolveMigratedUserId(doc.data().userid);
         }
     }
 
@@ -83,7 +91,7 @@ async function findUserId(event, obj) {
             .get();
 
         if (doc.exists) {
-            return doc.data().userid;
+            return resolveMigratedUserId(doc.data().userid);
         }
     }
 
@@ -105,7 +113,7 @@ async function findUserId(event, obj) {
             .get();
 
         if (doc.exists) {
-            return doc.data().userid;
+            return resolveMigratedUserId(doc.data().userid);
         }
     }
 
