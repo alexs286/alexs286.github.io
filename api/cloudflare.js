@@ -152,31 +152,13 @@ function toNumber(value) {
 }
 
 function getCloudflareConfig(user) {
-    const config = user?.cloudflare || {};
-
     return {
-        apiToken:
-            config.api_token ||
-            config.apiToken ||
-            user?.cloudflare_api_token ||
-            user?.api_token ||
-            null,
-
-        accountId:
-            config.account_id ||
-            config.accountId ||
-            user?.cloudflare_account_id ||
-            user?.account_id ||
-            null,
-
-        zoneId:
-            config.zone_id ||
-            config.zoneId ||
-            user?.cloudflare_zone_id ||
-            user?.zone_id ||
-            null
+        apiToken: user?.apitoken_cf || null,
+        accountId: user?.accid_cf || null,
+        zoneId: user?.zone_id || null
     };
 }
+
 
 function getRangeDates(range) {
     const days = Number(range.slice(0, -1));
