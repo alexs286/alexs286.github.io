@@ -423,13 +423,31 @@ async function resolvePublicHost(hostname) {
         );
     }
 
-    return records[0];
+    const publicRecord = records.find(record =>
+        record.address && net.isIP(record.address)
+    );
+
+    if (!publicRecord) {
+        throw new Error("No valid public IP address found");
+    }
+    return publicRecord;
 }
+
 
 function requestWebsite(url, resolvedAddress, method) {
     return new Promise((resolve, reject) => {
         const transport =
             url.protocol === "https:" ? https : http;
+
+        if (
+            !resolvedAddress ||
+            !resolvedAddress.address ||
+            !net.isIP(resolvedAddress.address)
+        ) {
+            return reject(
+                new Error("Invalid resolved IP address")
+            );
+        }
 
         const request = transport.request({
             protocol: url.protocol,
@@ -441,7 +459,6 @@ function requestWebsite(url, resolvedAddress, method) {
             headers: {
                 Host: url.host,
                 "User-Agent": "CreatorWeb-Uptime-Check/1.0",
-
                 ...(method === "GET"
                     ? { Range: "bytes=0-0" }
                     : {})
@@ -449,12 +466,19 @@ function requestWebsite(url, resolvedAddress, method) {
 
             servername: url.hostname,
 
-            lookup: (_hostname, _options, callback) => {
-                callback(
-                    null,
-                    resolvedAddress.address,
-                    resolvedAddress.family
-                );
+            lookup: (_hostname, options, callback) => {
+                if (options && options.all) {
+                    callback(null, [{
+                        address: resolvedAddress.address,
+                        family: resolvedAddress.family
+                    }]);
+                } else {
+                    callback(
+                        null,
+                        resolvedAddress.address,
+                        resolvedAddress.family
+                    );
+                }
             },
 
             timeout: 7000
@@ -469,13 +493,17 @@ function requestWebsite(url, resolvedAddress, method) {
         });
 
         request.on("timeout", () => {
-            request.destroy(new Error("Website check timed out"));
+            request.destroy(
+                new Error("Website check timed out")
+            );
         });
 
         request.on("error", reject);
+
         request.end();
     });
 }
+
 
 async function checkWebsite(rawUrl) {
     let currentUrl;
