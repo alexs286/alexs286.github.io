@@ -25,6 +25,7 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
+
 const ZONE_ANALYTICS_QUERY = `
 query CreatorWebZoneAnalytics($zoneTag: string, $start: Date, $end: Date) {
     viewer {
@@ -35,7 +36,6 @@ query CreatorWebZoneAnalytics($zoneTag: string, $start: Date, $end: Date) {
                 filter: {
                     date_geq: $start
                     date_lt: $end
-                    requestSource: "eyeball"
                 }
             ) {
                 dimensions {
@@ -57,6 +57,7 @@ query CreatorWebZoneAnalytics($zoneTag: string, $start: Date, $end: Date) {
         }
     }
 }`;
+
 
 const WORKERS_ANALYTICS_QUERY = `
 query CreatorWebWorkersAnalytics($accountTag: string, $start: string, $end: string) {
