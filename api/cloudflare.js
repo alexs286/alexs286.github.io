@@ -97,18 +97,36 @@ function sendJson(res, status, body) {
     return res.status(status).json(body);
 }
 
-function getUserId(req) {
-    const raw = req.query?.userId;
-
-    if (typeof raw !== "string") return null;
-
-    const value = raw.trim();
-
-    if (!value || value.length > 150 || value.includes("/")) {
-        return null;
+async function getAuthenticatedUserId(req) {
+    const match = (req.headers.authorization || "").match(/^Bearer\s+(.+)$/i);
+    if (!match) {
+        const error = new Error("Autenticazione richiesta. Accedi nuovamente.");
+        error.status = 401;
+        throw error;
     }
 
-    return value;
+    let decoded;
+    try {
+        decoded = await admin.auth().verifyIdToken(match[1], true);
+    } catch (_error) {
+        const error = new Error("Sessione non valida o scaduta.");
+        error.status = 401;
+        throw error;
+    }
+
+    const profile = await db.collection("utenti_dashboard").doc(decoded.uid).get();
+    if (!profile.exists) {
+        const error = new Error("Profilo utente non trovato.");
+        error.status = 404;
+        throw error;
+    }
+    if (profile.data()?.account?.must_change_password === true) {
+        const error = new Error("Prima di accedere ai dati devi modificare la password temporanea.");
+        error.status = 403;
+        throw error;
+    }
+
+    return decoded.uid;
 }
 
 function checkRateLimit(req) {
@@ -153,10 +171,13 @@ function toNumber(value) {
 }
 
 function getCloudflareConfig(user) {
+    // Supporta sia la struttura privata annidata usata dal pannello admin
+    // sia i campi top-level dei vecchi documenti, che restano leggibili durante la migrazione.
+    const cloudflare = user?.cloudflare || {};
     return {
-        apiToken: user?.apitoken_cf || null,
-        accountId: user?.accid_cf || null,
-        zoneId: user?.zone_id || null
+        apiToken: cloudflare.api_token || user?.apitoken_cf || user?.api_token || null,
+        accountId: cloudflare.account_id || user?.accid_cf || user?.account_id || null,
+        zoneId: cloudflare.zone_id || user?.zone_id || null
     };
 }
 
@@ -753,12 +774,13 @@ module.exports = async (req, res) => {
         });
     }
 
-    const userId = getUserId(req);
-
-    if (!userId) {
-        return sendJson(res, 400, {
+    let userId;
+    try {
+        userId = await getAuthenticatedUserId(req);
+    } catch (error) {
+        return sendJson(res, error.status || 401, {
             success: false,
-            error: "Missing or invalid userId"
+            error: error.status ? error.message : "Autenticazione non riuscita"
         });
     }
 
