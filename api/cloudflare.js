@@ -641,24 +641,25 @@ async function handleStats(req, res, userId) {
     });
 }
 
+
 async function handleSiteStatus(res, userId) {
-    const snapshot = await db
-        .collection("utenti_dashboard")
-        .doc(userId)
-        .get();
+    const [dashboardSnapshot, privateSnapshot] =
+        await Promise.all([
+            db.collection("utenti_dashboard").doc(userId).get(),
+            db.collection("users").doc(userId).get()
+        ]);
 
-    if (!snapshot.exists) {
-        return sendJson(res, 404, {
-            success: false,
-            error: "User not found"
-        });
-    }
+    const dashboardUser = dashboardSnapshot.exists
+        ? dashboardSnapshot.data() || {}
+        : {};
 
-    const user = snapshot.data() || {};
+    const privateUser = privateSnapshot.exists
+        ? privateSnapshot.data() || {}
+        : {};
 
     const websiteUrl =
-        user.url_sito ||
-        user.sito_web ||
+        dashboardUser.url_sito ||
+        privateUser.url_sito ||
         null;
 
     if (!websiteUrl) {
@@ -670,9 +671,7 @@ async function handleSiteStatus(res, userId) {
     }
 
     try {
-        const result = await checkWebsite(
-            String(websiteUrl)
-        );
+        const result = await checkWebsite(String(websiteUrl));
 
         return sendJson(res, 200, {
             ...result,
@@ -693,6 +692,7 @@ async function handleSiteStatus(res, userId) {
         });
     }
 }
+
 
 module.exports = async (req, res) => {
     setCors(req, res);
