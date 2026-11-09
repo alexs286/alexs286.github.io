@@ -1,4 +1,5 @@
 const admin = require('firebase-admin');
+const crypto = require('crypto');
 
 if (!admin.apps.length) {
     try {
@@ -60,44 +61,145 @@ export default async function handler(req, res) {
             const action = sanitizeInput(req.body.action);
 
             if (action === 'login') {
-                const email = sanitizeInput(req.body.email);
-                const password = sanitizeInput(req.body.password);
+                const identifier = sanitizeInput(req.body.email).toLowerCase();
 
-                if (!email || !password) {
+                const password = typeof req.body.password === 'string'
+                    ? req.body.password
+                    : '';
+
+                if (!identifier || !password) {
                     await delay(1000);
-                    return res.status(400).json({ error: 'Dati mancanti' });
+                    return res.status(400).json({
+                        error: 'Dati mancanti'
+                    });
                 }
 
                 const usersRef = db.collection('utenti_dashboard');
-                const snapshot = await usersRef.where('email', '==', String(email)).where('password', '==', String(password)).limit(1).get();
+
+                let snapshot = await usersRef
+                    .where('email', '==', identifier)
+                    .limit(5)
+                    .get();
 
                 if (snapshot.empty) {
-                    await delay(1500);
-                    return res.status(401).json({ error: 'Credenziali non valide' });
+                    snapshot = await usersRef
+                        .where('nome_utente', '==', identifier)
+                        .limit(5)
+                        .get();
                 }
 
-                return res.status(200).json({ success: true, userId: snapshot.docs[0].id });
+                const matchedUser = snapshot.docs.find(doc =>
+                    doc.data().password === password
+                );
+
+                if (!matchedUser) {
+                    await delay(1500);
+                    return res.status(401).json({
+                        error: 'Credenziali non valide'
+                    });
+                }
+
+                return res.status(200).json({
+                    success: true,
+                    userId: matchedUser.id
+                });
             }
 
             if (action === 'recovery') {
-                const email = sanitizeInput(req.body.email);
-                const code = sanitizeInput(req.body.code);
+                const email = sanitizeInput(req.body.email).toLowerCase();
+
+                const code = sanitizeInput(req.body.code)
+                    .replace(/[\s-]/g, '')
+                    .toUpperCase();
 
                 if (!email || !code) {
                     await delay(1000);
-                    return res.status(400).json({ error: 'Dati mancanti' });
+                    return res.status(400).json({
+                        error: 'Dati mancanti'
+                    });
+                }
+
+                if (!/^[A-F0-9]{12}$/.test(code)) {
+                    return res.status(401).json({
+                        error: 'Email o codice non validi'
+                    });
                 }
 
                 const usersRef = db.collection('utenti_dashboard');
-                const snapshot = await usersRef.where('email', '==', String(email)).where('codici_sicurezza', 'array-contains', String(code)).limit(1).get();
+
+                const snapshot = await usersRef
+                    .where('email', '==', email)
+                    .limit(1)
+                    .get();
 
                 if (snapshot.empty) {
                     await delay(1500);
-                    return res.status(401).json({ error: 'Dati non validi o codice errato' });
+                    return res.status(401).json({
+                        error: 'Email o codice non validi'
+                    });
                 }
 
-                return res.status(200).json({ success: true, userId: snapshot.docs[0].id });
+                const userRef = snapshot.docs[0].ref;
+
+                const codeHash = crypto
+                    .createHash('sha256')
+                    .update(code)
+                    .digest('hex');
+
+                const accepted = await db.runTransaction(async transaction => {
+                    const freshDoc = await transaction.get(userRef);
+
+                    if (!freshDoc.exists) return false;
+
+                    const user = freshDoc.data();
+
+                    const hashes = Array.isArray(user.codici_sicurezza_hash)
+                        ? user.codici_sicurezza_hash
+                        : [];
+
+                    const index = hashes.findIndex(savedHash => {
+                        if (
+                            typeof savedHash !== 'string' ||
+                            !/^[a-f0-9]{64}$/i.test(savedHash)
+                        ) {
+                            return false;
+                        }
+
+                        return crypto.timingSafeEqual(
+                            Buffer.from(savedHash, 'hex'),
+                            Buffer.from(codeHash, 'hex')
+                        );
+                    });
+
+                    if (index === -1) return false;
+
+                    const remainingCodes = [...hashes];
+                    remainingCodes.splice(index, 1);
+
+                    transaction.update(userRef, {
+                        codici_sicurezza_hash: remainingCodes,
+                        codici_sicurezza_usati:
+                            admin.firestore.FieldValue.increment(1),
+                        ultimo_uso_codice_sicurezza:
+                            admin.firestore.FieldValue.serverTimestamp()
+                    });
+
+                    return true;
+                });
+
+                if (!accepted) {
+                    await delay(1500);
+                    return res.status(401).json({
+                        error: 'Email o codice non validi'
+                    });
+                }
+
+                return res.status(200).json({
+                    success: true,
+                    userId: snapshot.docs[0].id
+                });
             }
+
 
             const { userId, type, message, userInfo } = req.body;
             const sUserId = sanitizeInput(userId);
