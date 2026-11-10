@@ -48,13 +48,7 @@ const USER_FIELDS = new Set([
     'tipo_servizio',
     'budget',
     'budget_ref',
-    'scadenza_dominio',
-    'stato_pagamento',
-    'totale_pagamento',
-    'importo_totale',
-    'metodo_pagamento',
-    'note_pagamento',
-    'costo_rata'
+    'scadenza_dominio'
 ]);
 
 const STATUS_VALUES = new Set([
@@ -282,6 +276,196 @@ module.exports = async function handler(req, res) {
             });
         }
 
+        if (action === 'configure_project_payment') {
+            const userId = body.userId;
+            if (!validDocumentId(userId)) {
+                return sendJson(res, 400, { error: 'ID utente non valido.' });
+            }
+
+            const profileRef = db.collection('utenti_dashboard').doc(userId);
+            const profileSnapshot = await profileRef.get();
+            if (!profileSnapshot.exists) {
+                return sendJson(res, 404, { error: 'Profilo cliente non trovato.' });
+            }
+
+            const totalEur = Number(body.totalEur);
+            if (!Number.isFinite(totalEur) || totalEur <= 0 || Math.round(totalEur * 100) <= 0 || Math.abs(totalEur * 100 - Math.round(totalEur * 100)) > 0.00001) {
+                return sendJson(res, 400, { error: 'Inserisci un totale progetto valido, in euro e con massimo due decimali.' });
+            }
+            const totalCents = Math.round(totalEur * 100);
+            if (!Number.isSafeInteger(totalCents)) {
+                return sendJson(res, 400, { error: 'Importo progetto troppo elevato.' });
+            }
+            if (totalCents < 4) {
+                return sendJson(res, 400, { error: 'Il totale deve essere almeno €0,04 affinché tutte e tre le rate abbiano un importo positivo.' });
+            }
+
+            const requestedPlan = cleanString(body.plan, 30).toLowerCase();
+            if (!['base', 'standard', 'premium'].includes(requestedPlan)) {
+                return sendJson(res, 400, { error: 'Seleziona il piano Base, Standard o Premium.' });
+            }
+
+            const profile = profileSnapshot.data() || {};
+            try {
+                const authUser = await admin.auth().getUser(userId);
+                if (authUser.disabled) return sendJson(res, 409, { error: 'L’account Firebase del cliente è disabilitato.' });
+            } catch (error) {
+                if (error.code === 'auth/user-not-found') return sendJson(res, 409, { error: 'Prima migra questo profilo collegandolo a un account Firebase Authentication.' });
+                throw error;
+            }
+            const payments = profile.pagamenti || {};
+            const currentProject = payments.progetto || {};
+            const currentPhase = Number(currentProject.fase || 0);
+            const currentTotal = Number(currentProject.totale_cent || 0);
+            const oldRates = currentProject.rate || {};
+            const anyPaid = ['rata_1', 'rata_2', 'rata_3'].some(key => oldRates[key]?.stato === 'paid');
+            const checkoutStarted = ['rata_1', 'rata_2', 'rata_3'].some(key => oldRates[key]?.stato === 'checkout_pending');
+
+            if (currentTotal > 0 && currentTotal !== totalCents && (currentPhase > 0 || anyPaid || checkoutStarted)) {
+                return sendJson(res, 409, { error: 'Il totale non può essere modificato dopo l’avvio delle fasi o l’apertura di un pagamento. Contatta il supporto per una correzione controllata.' });
+            }
+
+            const firstCents = Math.round(totalCents * 0.20);
+            const secondCents = Math.round(totalCents * 0.60);
+            const thirdCents = totalCents - firstCents - secondCents;
+            const amounts = [firstCents, secondCents, thirdCents];
+            const rates = {};
+            for (let index = 1; index <= 3; index++) {
+                const key = `rata_${index}`;
+                const oldRate = oldRates[key] || {};
+                rates[key] = {
+                    ...oldRate,
+                    numero: index,
+                    percentuale: [20, 60, 20][index - 1],
+                    importo_cent: amounts[index - 1],
+                    stato: oldRate.stato === 'paid'
+                        ? 'paid'
+                        : (currentPhase >= index ? (oldRate.stato || 'unlocked') : 'locked')
+                };
+            }
+
+            const oldSubscription = payments.abbonamento || {};
+            const subscriptionStatus = String(oldSubscription.stato || '').toLowerCase();
+            if (oldSubscription.checkout_lock_id || (
+                ['active', 'trialing', 'past_due', 'unpaid', 'incomplete', 'checkout_pending', 'in_attivazione'].includes(subscriptionStatus)
+                && oldSubscription.piano_scelto !== requestedPlan
+            )) {
+                return sendJson(res, 409, { error: 'Il piano non può essere modificato mentre esiste un abbonamento in corso. Il cliente potrà cambiarlo dal portale Stripe.' });
+            }
+
+            const paidCents = ['rata_1', 'rata_2', 'rata_3'].reduce((sum, key) => {
+                return sum + (rates[key]?.stato === 'paid' ? Number(rates[key].importo_cent || 0) : 0);
+            }, 0);
+            const project = {
+                ...currentProject,
+                fase: currentPhase,
+                totale_cent: totalCents,
+                valuta: 'eur',
+                totale_pagato_cent: paidCents,
+                residuo_cent: Math.max(0, totalCents - paidCents),
+                rate: rates,
+                ultimo_aggiornamento: admin.firestore.FieldValue.serverTimestamp()
+            };
+            const subscription = {
+                ...oldSubscription,
+                piano_scelto: requestedPlan,
+                attivazione_abilitata: oldSubscription.attivazione_abilitata === true,
+                stato: oldSubscription.stato || 'in_attesa'
+            };
+
+            await profileRef.set({
+                pagamenti: { progetto: project, abbonamento: subscription },
+                pagamenti_aggiornati_il: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+
+            return sendJson(res, 200, {
+                success: true,
+                total_cents: totalCents,
+                installments_cents: amounts,
+                phase: currentPhase,
+                plan: requestedPlan
+            });
+        }
+
+        if (action === 'advance_project_phase') {
+            const userId = body.userId;
+            const targetPhase = Number(body.phase);
+            if (!validDocumentId(userId)) {
+                return sendJson(res, 400, { error: 'ID utente non valido.' });
+            }
+            if (![1, 2, 3].includes(targetPhase)) {
+                return sendJson(res, 400, { error: 'Fase progetto non valida.' });
+            }
+
+            const profileRef = db.collection('utenti_dashboard').doc(userId);
+            const snapshot = await profileRef.get();
+            if (!snapshot.exists) return sendJson(res, 404, { error: 'Profilo cliente non trovato.' });
+            const profile = snapshot.data() || {};
+            try {
+                const authUser = await admin.auth().getUser(userId);
+                if (authUser.disabled) return sendJson(res, 409, { error: 'L’account Firebase del cliente è disabilitato.' });
+            } catch (error) {
+                if (error.code === 'auth/user-not-found') return sendJson(res, 409, { error: 'Prima migra questo profilo collegandolo a un account Firebase Authentication.' });
+                throw error;
+            }
+            const payments = profile.pagamenti || {};
+            const project = payments.progetto || {};
+            const currentPhase = Number(project.fase || 0);
+            if (Number(project.totale_cent || 0) <= 0) {
+                return sendJson(res, 409, { error: 'Prima configura il totale del progetto.' });
+            }
+            if (targetPhase !== currentPhase + 1) {
+                return sendJson(res, 409, { error: `Puoi attivare soltanto la fase ${currentPhase + 1}.` });
+            }
+            if (targetPhase > 1 && project.rate?.[`rata_${targetPhase - 1}`]?.stato !== 'paid') {
+                return sendJson(res, 409, { error: `Per attivare la fase ${targetPhase} deve prima risultare pagata la rata ${targetPhase - 1}.` });
+            }
+
+            const rateKey = `rata_${targetPhase}`;
+            await profileRef.update({
+                'pagamenti.progetto.fase': targetPhase,
+                [`pagamenti.progetto.rate.${rateKey}.stato`]: 'unlocked',
+                [`pagamenti.progetto.rate.${rateKey}.sbloccata_il`]: admin.firestore.FieldValue.serverTimestamp(),
+                'pagamenti.progetto.ultimo_aggiornamento': admin.firestore.FieldValue.serverTimestamp(),
+                'pagamenti_aggiornati_il': admin.firestore.FieldValue.serverTimestamp()
+            });
+            return sendJson(res, 200, { success: true, phase: targetPhase, unlocked_installment: targetPhase });
+        }
+
+        if (action === 'enable_subscription_activation') {
+            const userId = body.userId;
+            if (!validDocumentId(userId)) {
+                return sendJson(res, 400, { error: 'ID utente non valido.' });
+            }
+            const profileRef = db.collection('utenti_dashboard').doc(userId);
+            const snapshot = await profileRef.get();
+            if (!snapshot.exists) return sendJson(res, 404, { error: 'Profilo cliente non trovato.' });
+            const profile = snapshot.data() || {};
+            try {
+                const authUser = await admin.auth().getUser(userId);
+                if (authUser.disabled) return sendJson(res, 409, { error: 'L’account Firebase del cliente è disabilitato.' });
+            } catch (error) {
+                if (error.code === 'auth/user-not-found') return sendJson(res, 409, { error: 'Prima migra questo profilo collegandolo a un account Firebase Authentication.' });
+                throw error;
+            }
+            const payments = profile.pagamenti || {};
+            const project = payments.progetto || {};
+            const subscription = payments.abbonamento || {};
+            if (Number(project.fase || 0) !== 3 || project.rate?.rata_3?.stato !== 'paid') {
+                return sendJson(res, 409, { error: 'Puoi abilitare l’abbonamento solo dopo la fase 3 e il pagamento della rata finale.' });
+            }
+            if (!['base', 'standard', 'premium'].includes(String(subscription.piano_scelto || '').toLowerCase())) {
+                return sendJson(res, 409, { error: 'Prima seleziona il piano mensile del cliente.' });
+            }
+            await profileRef.update({
+                'pagamenti.abbonamento.attivazione_abilitata': true,
+                'pagamenti.abbonamento.stato': 'in_attesa_conferma_cliente',
+                'pagamenti.abbonamento.attivazione_abilitata_il': admin.firestore.FieldValue.serverTimestamp(),
+                'pagamenti_aggiornati_il': admin.firestore.FieldValue.serverTimestamp()
+            });
+            return sendJson(res, 200, { success: true, activation_enabled: true });
+        }
+
         if (action === 'create_user') {
             const collectionName = cleanString(body.collection || 'utenti_dashboard', 100);
             if (collectionName !== 'utenti_dashboard') {
@@ -417,7 +601,6 @@ module.exports = async function handler(req, res) {
             }
 
             await batch.commit();
-
             const stripeMappingCounts = {};
             const stripeMappingWarnings = [];
             let stripeEventCount = 0;
