@@ -249,7 +249,7 @@ async function registerDecision(req, res, id, body, ip, decision) {
       respondedAt: admin.firestore.FieldValue.serverTimestamp()
     });
     tx.set(eventRef, { ...auditPayload, auditHash, recordedAt: admin.firestore.FieldValue.serverTimestamp() });
-    outcome = { status: 200, success: true, decision, eventId, auditHash, requestTimeIso, quoteNumber: quote.quoteNumber };
+    outcome = { status: 200, success: true, decision, eventId, auditHash, requestTimeIso, quoteNumber: quote.quoteNumber, customerName };
   });
 
   if (!outcome) return json(res, 500, { error: 'Non è stato possibile registrare la risposta.' });
@@ -261,6 +261,25 @@ function publicQuoteData(id, quote) {
   const client = quote.client || {};
   const acceptance = quote.acceptance || null;
   const rejection = quote.rejection || null;
+  let document = null;
+
+  if (quote.document && typeof quote.document === 'object') {
+    const fields = quote.document.fields && typeof quote.document.fields === 'object'
+      ? { ...quote.document.fields }
+      : {};
+    delete fields.clientEmail;
+    document = {
+      fields,
+      items: Array.isArray(quote.document.items) ? quote.document.items : [],
+      itemPricing: quote.document.itemPricing === true,
+      provider: quote.document.provider || {},
+      legal: quote.document.legal || {},
+      recurringPriceCents: Number.isSafeInteger(quote.document.recurringPriceCents)
+        ? quote.document.recurringPriceCents
+        : null
+    };
+  }
+
   return {
     id,
     quoteNumber: quote.quoteNumber || '',
@@ -274,6 +293,7 @@ function publicQuoteData(id, quote) {
     items: Array.isArray(quote.items) ? quote.items : [],
     totalCents: Number(quote.totalCents || 0),
     currency: quote.currency || 'EUR',
+    document,
     terms: quote.terms || {},
     termsVersion: quote.termsVersion || '',
     termsUrl: quote.termsUrl || 'https://www.creatorweb.cc/termini.html',
@@ -295,6 +315,7 @@ function publicQuoteData(id, quote) {
     } : null
   };
 }
+
 
 module.exports = async function handler(req, res) {
   setCors(req, res);
