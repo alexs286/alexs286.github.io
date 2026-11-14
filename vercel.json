@@ -10,5 +10,11 @@
         { "key": "Access-Control-Max-Age", "value": "86400" }
       ]
     }
+  ],
+  "rewrites": [
+    {
+      "source": "/accettazione/:id",
+      "destination": "/accettazione.html"
+    }
   ]
 }
