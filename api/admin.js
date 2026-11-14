@@ -25,12 +25,13 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 const rateLimits = new Map();
 
-const ALLOWED_ORIGIN = 'https://www.creatorweb.cc';
+const ALLOWED_ORIGINS = new Set(['https://creatorweb.cc', 'https://www.creatorweb.cc']);
 const ALLOWED_COLLECTIONS = new Set([
     'richieste_preventivo',
     'utenti_dashboard',
     'richieste_supporto',
-    'stato del servizio'
+    'stato del servizio',
+    'preventivi_emessi'
 ]);
 
 const USER_FIELDS = new Set([
@@ -62,8 +63,8 @@ const STATUS_VALUES = new Set([
 function setCors(req, res) {
     const origin = req.headers.origin;
 
-    if (!origin || origin === ALLOWED_ORIGIN) {
-        res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+    if (!origin || ALLOWED_ORIGINS.has(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin || 'https://www.creatorweb.cc');
     }
 
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -229,7 +230,7 @@ module.exports = async function handler(req, res) {
         return res.status(204).end();
     }
 
-    if (req.headers.origin && req.headers.origin !== ALLOWED_ORIGIN) {
+    if (req.headers.origin && !ALLOWED_ORIGINS.has(req.headers.origin)) {
         return sendJson(res, 403, { error: 'Origin non autorizzata' });
     }
 
@@ -242,10 +243,127 @@ module.exports = async function handler(req, res) {
     }
 
     try {
-        await verifyAdmin(req);
+        const adminUser = await verifyAdmin(req);
 
         const body = req.body && typeof req.body === 'object' ? req.body : {};
         const action = cleanString(body.action, 80);
+
+
+        if (action === 'create_quote') {
+            const input = body.quote && typeof body.quote === 'object' && !Array.isArray(body.quote)
+                ? body.quote
+                : {};
+
+            const clientName = cleanString(input.clientName, 160);
+            const clientEmail = cleanString(input.clientEmail, 254).toLowerCase();
+            const clientType = cleanString(input.clientType, 30).toLowerCase();
+            const clientAddress = cleanString(input.clientAddress, 500);
+            const projectTitle = cleanString(input.projectTitle, 180);
+            const description = cleanString(input.description, 5000);
+            const included = cleanString(input.included, 5000);
+            const excluded = cleanString(input.excluded, 5000);
+            const timeline = cleanString(input.timeline, 1500);
+            const paymentTerms = cleanString(input.paymentTerms, 2000);
+            const notes = cleanString(input.notes, 3000);
+            const revisions = Number(input.revisions);
+            const validDays = Number(input.validDays || 30);
+
+            if (!clientName || !clientEmail || !projectTitle || !description) {
+                return sendJson(res, 400, { error: 'Compila nome/email del cliente, titolo e descrizione del progetto.' });
+            }
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clientEmail)) {
+                return sendJson(res, 400, { error: 'Indirizzo email del cliente non valido.' });
+            }
+            if (!['consumer', 'professional'].includes(clientType)) {
+                return sendJson(res, 400, { error: 'Indica se il cliente è un consumatore o un professionista.' });
+            }
+            if (!Number.isInteger(revisions) || revisions < 0 || revisions > 20) {
+                return sendJson(res, 400, { error: 'Numero di revisioni non valido.' });
+            }
+            if (!Number.isInteger(validDays) || validDays < 1 || validDays > 90) {
+                return sendJson(res, 400, { error: 'La validità deve essere compresa tra 1 e 90 giorni.' });
+            }
+            if (!Array.isArray(input.items) || input.items.length < 1 || input.items.length > 40) {
+                return sendJson(res, 400, { error: 'Inserisci da 1 a 40 voci di preventivo.' });
+            }
+
+            const items = [];
+            let totalCents = 0;
+            for (const rawItem of input.items) {
+                if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) {
+                    return sendJson(res, 400, { error: 'Una voce del preventivo non è valida.' });
+                }
+                const itemDescription = cleanString(rawItem.description, 500);
+                const quantity = Number(rawItem.quantity);
+                const unitPriceCents = Number(rawItem.unitPriceCents);
+                if (!itemDescription || !Number.isInteger(quantity) || quantity < 1 || quantity > 1000 ||
+                    !Number.isSafeInteger(unitPriceCents) || unitPriceCents < 0 || unitPriceCents > 100000000) {
+                    return sendJson(res, 400, { error: 'Controlla descrizione, quantità e prezzo di ogni voce.' });
+                }
+                const lineTotalCents = quantity * unitPriceCents;
+                if (!Number.isSafeInteger(lineTotalCents) || !Number.isSafeInteger(totalCents + lineTotalCents)) {
+                    return sendJson(res, 400, { error: 'Il totale del preventivo supera i limiti consentiti.' });
+                }
+                totalCents += lineTotalCents;
+                items.push({ description: itemDescription, quantity, unitPriceCents, lineTotalCents });
+            }
+            if (totalCents <= 0) {
+                return sendJson(res, 400, { error: 'Il totale del preventivo deve essere maggiore di zero.' });
+            }
+
+            const now = new Date();
+            const validUntil = new Date(now.getTime() + validDays * 24 * 60 * 60 * 1000);
+            const id = crypto.randomBytes(32).toString('hex');
+            const year = now.getFullYear();
+            const quoteNumber = `CW-${year}-${id.slice(0, 8).toUpperCase()}`;
+            const termsVersion = process.env.TERMS_VERSION || '2026-11-12';
+            const siteUrl = (process.env.PUBLIC_SITE_URL || 'https://www.creatorweb.cc').replace(/\/+$/, '');
+            const publicUrl = `${siteUrl}/accettazione/${id}`;
+
+            const snapshot = {
+                quoteNumber,
+                client: { name: clientName, email: clientEmail, type: clientType, address: clientAddress },
+                project: { title: projectTitle, description, included, excluded, timeline },
+                items,
+                totalCents,
+                terms: { paymentTerms, revisions, notes, validDays },
+                termsVersion,
+                termsUrl: `${siteUrl}/termini.html`
+            };
+            const quoteHash = crypto.createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
+            const quoteRef = db.collection('preventivi_emessi').doc(id);
+            const record = {
+                id,
+                quoteNumber,
+                client: snapshot.client,
+                project: snapshot.project,
+                items,
+                totalCents,
+                currency: 'EUR',
+                terms: snapshot.terms,
+                termsVersion,
+                termsUrl: snapshot.termsUrl,
+                quoteHash,
+                publicUrl,
+                status: 'pending',
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                createdAtIso: now.toISOString(),
+                validUntil: admin.firestore.Timestamp.fromDate(validUntil),
+                validUntilIso: validUntil.toISOString(),
+                createdBy: adminUser.uid
+            };
+
+            await quoteRef.create(record);
+            return sendJson(res, 201, {
+                success: true,
+                id,
+                quoteNumber,
+                publicUrl,
+                totalCents,
+                validUntil: validUntil.toISOString(),
+                status: 'pending'
+            });
+        }
 
         if (action === 'get_collection') {
             const collectionName = cleanString(body.collection, 100);
