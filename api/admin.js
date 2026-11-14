@@ -253,82 +253,194 @@ module.exports = async function handler(req, res) {
             const input = body.quote && typeof body.quote === 'object' && !Array.isArray(body.quote)
                 ? body.quote
                 : {};
+            const suppliedDocument = input.document && typeof input.document === 'object' && !Array.isArray(input.document)
+                ? input.document
+                : {};
+            const rawFields = suppliedDocument.fields && typeof suppliedDocument.fields === 'object'
+                ? suppliedDocument.fields
+                : {};
+            const rawItems = Array.isArray(suppliedDocument.items)
+                ? suppliedDocument.items
+                : (Array.isArray(input.items) ? input.items : []);
 
-            const clientName = cleanString(input.clientName, 160);
-            const clientEmail = cleanString(input.clientEmail, 254).toLowerCase();
-            const clientType = cleanString(input.clientType, 30).toLowerCase();
-            const clientAddress = cleanString(input.clientAddress, 500);
-            const projectTitle = cleanString(input.projectTitle, 180);
-            const description = cleanString(input.description, 5000);
-            const included = cleanString(input.included, 5000);
-            const excluded = cleanString(input.excluded, 5000);
-            const timeline = cleanString(input.timeline, 1500);
-            const paymentTerms = cleanString(input.paymentTerms, 2000);
-            const notes = cleanString(input.notes, 3000);
-            const revisions = Number(input.revisions);
-            const validDays = Number(input.validDays || 30);
+            const fieldLimits = {
+                clientType: 30, quoteNumber: 50, quoteDate: 10, validUntil: 10,
+                clientName: 160, clientContact: 160, clientEmail: 254, clientPhone: 80,
+                clientAddress: 500, clientCity: 200, clientCountry: 100, clientVat: 50,
+                projectTitle: 180, projectObject: 3000, projectDescription: 5000,
+                included: 5000, excluded: 5000, clientDuties: 3000,
+                duration: 300, deliveryDate: 200, revisions: 200, deliveryMethod: 1000,
+                extraSpecs: 3000, grandTotal: 30, thirdPartyCosts: 2500,
+                paymentMethod: 100, paymentTerms: 2000, paymentDetails: 3000,
+                recurringPlan: 30, recurringTerms: 4000,
+                changesTerms: 4000, delayTerms: 4000, ownershipTerms: 4000,
+                hostingTerms: 4000, backupExitTerms: 4000, supportTerms: 4000,
+                confidentialityTerms: 3000, privacyTerms: 3000, otherTerms: 3000,
+                withdrawalText: 4000, withdrawalEmail: 254,
+                acceptanceText: 3000, specificApproval: 4000, finalNotes: 3000
+            };
+            const fields = {};
+            for (const [key, maxLength] of Object.entries(fieldLimits)) {
+                if (typeof rawFields[key] === 'string') fields[key] = cleanString(rawFields[key], maxLength);
+            }
+            fields.useItemPricing = rawFields.useItemPricing === true;
+
+            const clientName = cleanString(fields.clientName || input.clientName, 160);
+            const clientEmail = cleanString(fields.clientEmail || input.clientEmail, 254).toLowerCase();
+            const rawClientType = cleanString(fields.clientType || input.clientType, 30).toLowerCase();
+            const clientType = rawClientType === 'consumer' ? 'consumer'
+                : (['business', 'professional'].includes(rawClientType) ? 'professional' : '');
+            const clientAddress = cleanString(fields.clientAddress || input.clientAddress, 500);
+            const projectTitle = cleanString(fields.projectTitle || input.projectTitle, 180);
+            const description = cleanString(fields.projectDescription || fields.projectObject || input.description, 5000);
+            const included = cleanString(fields.included || input.included, 5000);
+            const excluded = cleanString(fields.excluded || input.excluded, 5000);
+            const timeline = [
+                fields.duration ? `Tempistica indicativa: ${fields.duration}` : '',
+                fields.deliveryDate ? `Data / periodo di consegna: ${fields.deliveryDate}` : '',
+                fields.deliveryMethod ? `Modalità di consegna: ${fields.deliveryMethod}` : '',
+                cleanString(input.timeline, 1500)
+            ].filter(Boolean).join('\n');
+            const paymentTerms = cleanString(fields.paymentTerms || input.paymentTerms, 2000);
+            const revisions = cleanString(fields.revisions || input.revisions || '3 cicli di revisione', 200);
+            const notes = cleanString(fields.otherTerms || fields.finalNotes || input.notes, 3000);
 
             if (!clientName || !clientEmail || !projectTitle || !description) {
-                return sendJson(res, 400, { error: 'Compila nome/email del cliente, titolo e descrizione del progetto.' });
+                return sendJson(res, 400, { error: 'Compila il cliente, l’email, il titolo e la descrizione del progetto.' });
             }
             if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clientEmail)) {
                 return sendJson(res, 400, { error: 'Indirizzo email del cliente non valido.' });
             }
-            if (!['consumer', 'professional'].includes(clientType)) {
-                return sendJson(res, 400, { error: 'Indica se il cliente è un consumatore o un professionista.' });
+            if (!clientType) {
+                return sendJson(res, 400, { error: 'Indica se il cliente è un consumatore oppure un professionista/impresa.' });
             }
-            if (!Number.isInteger(revisions) || revisions < 0 || revisions > 20) {
-                return sendJson(res, 400, { error: 'Numero di revisioni non valido.' });
-            }
-            if (!Number.isInteger(validDays) || validDays < 1 || validDays > 90) {
-                return sendJson(res, 400, { error: 'La validità deve essere compresa tra 1 e 90 giorni.' });
-            }
-            if (!Array.isArray(input.items) || input.items.length < 1 || input.items.length > 40) {
-                return sendJson(res, 400, { error: 'Inserisci da 1 a 40 voci di preventivo.' });
+            if (rawItems.length > 40) {
+                return sendJson(res, 400, { error: 'Puoi inserire al massimo 40 voci di prestazione.' });
             }
 
+            const itemPricing = suppliedDocument.itemPricing === true || fields.useItemPricing === true;
             const items = [];
-            let totalCents = 0;
-            for (const rawItem of input.items) {
+            let calculatedCents = 0;
+            for (const rawItem of rawItems) {
                 if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) {
                     return sendJson(res, 400, { error: 'Una voce del preventivo non è valida.' });
                 }
                 const itemDescription = cleanString(rawItem.description, 500);
-                const quantity = Number(rawItem.quantity);
-                const unitPriceCents = Number(rawItem.unitPriceCents);
-                if (!itemDescription || !Number.isInteger(quantity) || quantity < 1 || quantity > 1000 ||
+                if (!itemDescription) continue;
+
+                const quantity = itemPricing ? Number(rawItem.quantity) : 1;
+                const unitPriceCents = itemPricing ? Number(rawItem.unitPriceCents) : 0;
+                if (!Number.isFinite(quantity) || quantity <= 0 || quantity > 1000 ||
+                    Math.abs(quantity * 100 - Math.round(quantity * 100)) > 0.000001 ||
                     !Number.isSafeInteger(unitPriceCents) || unitPriceCents < 0 || unitPriceCents > 100000000) {
-                    return sendJson(res, 400, { error: 'Controlla descrizione, quantità e prezzo di ogni voce.' });
+                    return sendJson(res, 400, { error: 'Controlla quantità e prezzo unitario delle prestazioni.' });
                 }
-                const lineTotalCents = quantity * unitPriceCents;
-                if (!Number.isSafeInteger(lineTotalCents) || !Number.isSafeInteger(totalCents + lineTotalCents)) {
-                    return sendJson(res, 400, { error: 'Il totale del preventivo supera i limiti consentiti.' });
+
+                const lineTotalCents = Math.round(quantity * unitPriceCents);
+                if (!Number.isSafeInteger(lineTotalCents) || !Number.isSafeInteger(calculatedCents + lineTotalCents)) {
+                    return sendJson(res, 400, { error: 'Il totale delle prestazioni supera i limiti consentiti.' });
                 }
-                totalCents += lineTotalCents;
+                calculatedCents += lineTotalCents;
                 items.push({ description: itemDescription, quantity, unitPriceCents, lineTotalCents });
             }
-            if (totalCents <= 0) {
-                return sendJson(res, 400, { error: 'Il totale del preventivo deve essere maggiore di zero.' });
+
+            let totalCents = Number(input.totalCents);
+            if (!Number.isSafeInteger(totalCents) && fields.grandTotal !== undefined && fields.grandTotal !== '') {
+                const euros = Number(String(fields.grandTotal).replace(',', '.'));
+                if (Number.isFinite(euros)) totalCents = Math.round(euros * 100);
+            }
+            if (!Number.isSafeInteger(totalCents) || totalCents <= 0) {
+                totalCents = itemPricing ? calculatedCents : 0;
+            }
+            if (!Number.isSafeInteger(totalCents) || totalCents <= 0) {
+                return sendJson(res, 400, { error: 'Inserisci un totale preventivo maggiore di zero.' });
             }
 
             const now = new Date();
-            const validUntil = new Date(now.getTime() + validDays * 24 * 60 * 60 * 1000);
+            const todayIso = now.toISOString().slice(0, 10);
+            let validUntilIso = cleanString(fields.validUntil, 10);
+            if (!isValidDateOnly(validUntilIso) || !validUntilIso) {
+                const fallbackDays = Number(input.validDays || 30);
+                if (!Number.isInteger(fallbackDays) || fallbackDays < 1 || fallbackDays > 90) {
+                    return sendJson(res, 400, { error: 'La validità deve essere compresa tra 1 e 90 giorni.' });
+                }
+                const fallback = new Date(now.getTime() + fallbackDays * 24 * 60 * 60 * 1000);
+                validUntilIso = fallback.toISOString().slice(0, 10);
+            }
+            const [validYear, validMonth, validDay] = validUntilIso.split('-').map(Number);
+            const validUntil = new Date(Date.UTC(validYear, validMonth - 1, validDay, 23, 59, 59));
+            const todayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+            const expiryDayUtc = Date.UTC(validYear, validMonth - 1, validDay);
+            const validDays = Math.round((expiryDayUtc - todayUtc) / 86400000) + 1;
+            if (!Number.isFinite(validUntil.getTime()) || validUntil.getTime() <= now.getTime() ||
+                validDays < 1 || validDays > 90) {
+                return sendJson(res, 400, { error: 'La data di validità deve essere compresa tra oggi e i prossimi 90 giorni.' });
+            }
+
+            fields.clientName = clientName;
+            fields.clientEmail = clientEmail;
+            fields.clientType = clientType;
+            fields.projectTitle = projectTitle;
+            fields.quoteDate = todayIso;
+            fields.validUntil = validUntilIso;
+
+            const providerRaw = suppliedDocument.provider && typeof suppliedDocument.provider === 'object'
+                ? suppliedDocument.provider
+                : {};
+            const provider = {
+                brand: cleanString(providerRaw.brand || 'CreatorWeb', 80),
+                legalName: cleanString(providerRaw.legalName, 200),
+                vatNumber: cleanString(providerRaw.vatNumber, 40),
+                address: cleanString(providerRaw.address, 500),
+                postalCity: cleanString(providerRaw.postalCity, 200),
+                country: cleanString(providerRaw.country || 'Italia', 100),
+                email: cleanString(providerRaw.email, 254),
+                phone: cleanString(providerRaw.phone, 80),
+                website: cleanString(providerRaw.website || 'https://www.creatorweb.cc/', 300)
+            };
+            const legalRaw = suppliedDocument.legal && typeof suppliedDocument.legal === 'object'
+                ? suppliedDocument.legal
+                : {};
+            const safeLegalUrl = (value, fallback) => {
+                const url = cleanString(value || fallback, 500);
+                return /^https:\/\/[^\s]+$/i.test(url) ? url : fallback;
+            };
+            const legal = {
+                termsUrl: safeLegalUrl(legalRaw.termsUrl, 'https://www.creatorweb.cc/termini.html'),
+                privacyUrl: safeLegalUrl(legalRaw.privacyUrl, 'https://www.creatorweb.cc/privacy.html'),
+                taxStatement: cleanString(legalRaw.taxStatement, 1000)
+            };
+            const subscriptionPrices = { Base: 1000, Standard: 2000, Premium: 5000 };
+            const recurringPlan = cleanString(fields.recurringPlan, 30);
+            const recurringPriceCents = Object.prototype.hasOwnProperty.call(subscriptionPrices, recurringPlan)
+                ? subscriptionPrices[recurringPlan] : null;
+
             const id = crypto.randomBytes(32).toString('hex');
             const year = now.getFullYear();
             const quoteNumber = `CW-${year}-${id.slice(0, 8).toUpperCase()}`;
+            fields.quoteNumber = quoteNumber;
             const termsVersion = process.env.TERMS_VERSION || '2026-11-12';
             const siteUrl = (process.env.PUBLIC_SITE_URL || 'https://www.creatorweb.cc').replace(/\/+$/, '');
             const publicUrl = `${siteUrl}/accettazione/${id}`;
 
+            const documentSnapshot = {
+                fields,
+                items,
+                itemPricing,
+                provider,
+                legal,
+                recurringPriceCents
+            };
             const snapshot = {
                 quoteNumber,
                 client: { name: clientName, email: clientEmail, type: clientType, address: clientAddress },
                 project: { title: projectTitle, description, included, excluded, timeline },
                 items,
                 totalCents,
+                document: documentSnapshot,
                 terms: { paymentTerms, revisions, notes, validDays },
                 termsVersion,
-                termsUrl: `${siteUrl}/termini.html`
+                termsUrl: legal.termsUrl
             };
             const quoteHash = crypto.createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
             const quoteRef = db.collection('preventivi_emessi').doc(id);
@@ -340,9 +452,10 @@ module.exports = async function handler(req, res) {
                 items,
                 totalCents,
                 currency: 'EUR',
+                document: documentSnapshot,
                 terms: snapshot.terms,
                 termsVersion,
-                termsUrl: snapshot.termsUrl,
+                termsUrl: legal.termsUrl,
                 quoteHash,
                 publicUrl,
                 status: 'pending',
