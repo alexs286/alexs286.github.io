@@ -111,8 +111,32 @@ module.exports = async function handler(req, res) {
         const { uid, profile } = await requireCustomer(req);
 
         if (req.method === 'GET') {
-            return res.status(200).json(sanitizeProfile(profile));
+            const communicationSnapshot = await db
+                .collection('comunicazioni')
+                .where('published', '==', true)
+                .get();
+        
+            const communications = communicationSnapshot.docs
+                .map(doc => ({
+                    id: doc.id,
+                    ...sanitizeProfile(doc.data())
+                }))
+                .filter(item =>
+                    item.targetType === 'all' ||
+                    (item.targetType === 'user' && item.targetUid === uid)
+                )
+                .sort((a, b) => {
+                    const dateA = new Date(a.createdAt || 0).getTime();
+                    const dateB = new Date(b.createdAt || 0).getTime();
+                    return dateB - dateA;
+                });
+        
+            return res.status(200).json({
+                ...sanitizeProfile(profile),
+                comunicazioni: communications
+            });
         }
+        
 
         const body = req.body && typeof req.body === 'object' ? req.body : {};
         const type = cleanString(body.type, 100);
