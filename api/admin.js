@@ -31,7 +31,8 @@ const ALLOWED_COLLECTIONS = new Set([
     'utenti_dashboard',
     'richieste_supporto',
     'stato del servizio',
-    'preventivi_emessi'
+    'preventivi_emessi',
+    'comunicazioni'
 ]);
 
 const USER_FIELDS = new Set([
@@ -477,7 +478,65 @@ module.exports = async function handler(req, res) {
                 status: 'pending'
             });
         }
-
+        if (action === 'create_communication') {
+            const title = cleanString(body.title, 150);
+            const message = cleanString(body.message, 5000);
+            const targetType = cleanString(body.targetType, 20);
+            const targetUid = cleanString(body.targetUid, 150);
+        
+            if (!title || !message) {
+                return sendJson(res, 400, {
+                    error: 'Inserisci un titolo e un messaggio.'
+                });
+            }
+        
+            if (!['all', 'user'].includes(targetType)) {
+                return sendJson(res, 400, {
+                    error: 'Destinatario non valido.'
+                });
+            }
+        
+            let recipientUid = null;
+        
+            if (targetType === 'user') {
+                if (!validDocumentId(targetUid)) {
+                    return sendJson(res, 400, {
+                        error: 'Seleziona un cliente valido.'
+                    });
+                }
+        
+                const userSnapshot = await db
+                    .collection('utenti_dashboard')
+                    .doc(targetUid)
+                    .get();
+        
+                if (!userSnapshot.exists) {
+                    return sendJson(res, 404, {
+                        error: 'Cliente non trovato.'
+                    });
+                }
+        
+                recipientUid = targetUid;
+            }
+        
+            const communicationRef = db.collection('comunicazioni').doc();
+        
+            await communicationRef.create({
+                title,
+                message,
+                targetType,
+                targetUid: recipientUid,
+                published: true,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                createdBy: adminUser.uid
+            });
+        
+            return sendJson(res, 201, {
+                success: true,
+                id: communicationRef.id
+            });
+        }
+        
         if (action === 'get_collection') {
             const collectionName = cleanString(body.collection, 100);
 
