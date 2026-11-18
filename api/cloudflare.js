@@ -41,15 +41,51 @@ query CreatorWebZoneAnalytics($zoneTag: string, $start: Date, $end: Date) {
                 dimensions {
                     date
                 }
+
                 sum {
                     requests
                     bytes
                     pageViews
+
+                    cachedRequests
+                    cachedBytes
+
+                    encryptedRequests
+                    encryptedBytes
+
                     countryMap {
                         clientCountryName
                         requests
+                        bytes
+                    }
+
+                    responseStatusMap {
+                        edgeResponseStatus
+                        requests
+                    }
+
+                    contentTypeMap {
+                        edgeResponseContentTypeName
+                        requests
+                        bytes
+                    }
+
+                    browserMap {
+                        uaBrowserFamily
+                        pageViews
+                    }
+
+                    clientSSLMap {
+                        clientSSLProtocol
+                        requests
+                    }
+
+                    ipClassMap {
+                        ipType
+                        requests
                     }
                 }
+
                 uniq {
                     uniques
                 }
@@ -73,6 +109,10 @@ query CreatorWebWorkersAnalytics($accountTag: string, $start: string, $end: stri
                 sum {
                     requests
                     errors
+                    subrequests
+                    cpuTimeUs
+                    wallTime
+                    responseBodySize
                 }
             }
         }
@@ -171,8 +211,6 @@ function toNumber(value) {
 }
 
 function getCloudflareConfig(user) {
-    // Supporta sia la struttura privata annidata usata dal pannello admin
-    // sia i campi top-level dei vecchi documenti, che restano leggibili durante la migrazione.
     const cloudflare = user?.cloudflare || {};
     return {
         apiToken: cloudflare.api_token || user?.apitoken_cf || user?.api_token || null,
@@ -251,72 +289,188 @@ async function cloudflareGraphQL(apiToken, query, variables) {
     }
 }
 
+function aggregateBreakdown(series, property, labelKey, valueKey) {
+    const totals = new Map();
+
+    for (const row of series) {
+        const items = Array.isArray(row[property])
+            ? row[property]
+            : [];
+
+        for (const item of items) {
+            const name = String(item[labelKey] || 'Altro');
+            const value = toNumber(item[valueKey]);
+
+            totals.set(name, (totals.get(name) || 0) + value);
+        }
+    }
+
+    return Array.from(totals.entries())
+        .map(([name, value]) => ({ name, value }))
+        .sort((a, b) => b.value - a.value)
+        .slice(0, 10);
+}
+
+
 function normalizeAnalytics(records) {
     const series = (Array.isArray(records) ? records : [])
         .map(record => {
             const sum = record.sum || {};
 
+            const responseStatuses = Array.isArray(sum.responseStatusMap)
+                ? sum.responseStatusMap.map(item => ({
+                    name: String(item.edgeResponseStatus || 'N/D'),
+                    requests: toNumber(item.requests)
+                }))
+                : [];
+
+            const contentTypes = Array.isArray(sum.contentTypeMap)
+                ? sum.contentTypeMap.map(item => ({
+                    name: item.edgeResponseContentTypeName || 'Altro',
+                    requests: toNumber(item.requests),
+                    bytes: toNumber(item.bytes)
+                }))
+                : [];
+
+            const browsers = Array.isArray(sum.browserMap)
+                ? sum.browserMap.map(item => ({
+                    name: item.uaBrowserFamily || 'Altro',
+                    pageviews: toNumber(item.pageViews)
+                }))
+                : [];
+
+            const sslProtocols = Array.isArray(sum.clientSSLMap)
+                ? sum.clientSSLMap.map(item => ({
+                    name: item.clientSSLProtocol || 'Non disponibile',
+                    requests: toNumber(item.requests)
+                }))
+                : [];
+
+            const ipClasses = Array.isArray(sum.ipClassMap)
+                ? sum.ipClassMap.map(item => ({
+                    name: item.ipType || 'Altro',
+                    requests: toNumber(item.requests)
+                }))
+                : [];
+
+            const countries = Array.isArray(sum.countryMap)
+                ? sum.countryMap.map(item => ({
+                    name: item.clientCountryName || 'Altro',
+                    requests: toNumber(item.requests),
+                    bytes: toNumber(item.bytes)
+                }))
+                : [];
+
+            const statusTotals = {
+                errors_4xx: 0,
+                errors_5xx: 0
+            };
+
+            for (const item of responseStatuses) {
+                const status = Number(item.name);
+
+                if (status >= 400 && status < 500) {
+                    statusTotals.errors_4xx += item.requests;
+                } else if (status >= 500 && status < 600) {
+                    statusTotals.errors_5xx += item.requests;
+                }
+            }
+
             return {
                 date: record.dimensions?.date || null,
+
                 requests: toNumber(sum.requests),
                 pageviews: toNumber(sum.pageViews),
                 unique_visitors: toNumber(record.uniq?.uniques),
                 bandwidth_bytes: toNumber(sum.bytes),
 
-                countries: Array.isArray(sum.countryMap)
-                    ? sum.countryMap.map(country => ({
-                        name: country.clientCountryName || "Altro",
-                        requests: toNumber(country.requests)
-                    }))
-                    : []
+                cached_requests: toNumber(sum.cachedRequests),
+                cached_bytes: toNumber(sum.cachedBytes),
+
+                encrypted_requests: toNumber(sum.encryptedRequests),
+                encrypted_bytes: toNumber(sum.encryptedBytes),
+
+                errors_4xx: statusTotals.errors_4xx,
+                errors_5xx: statusTotals.errors_5xx,
+
+                countries,
+                response_statuses: responseStatuses,
+                content_types: contentTypes,
+                browsers,
+                ssl_protocols: sslProtocols,
+                ip_classes: ipClasses
             };
         })
         .filter(row => row.date);
 
-    const countryTotals = new Map();
+    const sumField = field => series.reduce(
+        (total, row) => total + toNumber(row[field]),
+        0
+    );
 
-    for (const day of series) {
-        for (const country of day.countries) {
-            countryTotals.set(
-                country.name,
-                (countryTotals.get(country.name) || 0) + country.requests
-            );
-        }
-    }
+    const requests = sumField('requests');
+    const cachedRequests = sumField('cached_requests');
+    const encryptedRequests = sumField('encrypted_requests');
 
     return {
         summary: {
-            requests: series.reduce(
-                (total, row) => total + row.requests,
-                0
-            ),
+            requests,
+            pageviews: sumField('pageviews'),
+            unique_visitors: sumField('unique_visitors'),
+            bandwidth_bytes: sumField('bandwidth_bytes'),
 
-            pageviews: series.reduce(
-                (total, row) => total + row.pageviews,
-                0
-            ),
+            cached_requests: cachedRequests,
+            cached_bytes: sumField('cached_bytes'),
 
-            unique_visitors: series.reduce(
-                (total, row) => total + row.unique_visitors,
-                0
-            ),
+            cache_hit_rate: requests > 0
+                ? Number((cachedRequests / requests * 100).toFixed(2))
+                : 0,
 
-            bandwidth_bytes: series.reduce(
-                (total, row) => total + row.bandwidth_bytes,
-                0
-            )
+            encrypted_requests: encryptedRequests,
+            encrypted_bytes: sumField('encrypted_bytes'),
+
+            https_requests_rate: requests > 0
+                ? Number((encryptedRequests / requests * 100).toFixed(2))
+                : 0,
+
+            errors_4xx: sumField('errors_4xx'),
+            errors_5xx: sumField('errors_5xx')
         },
 
-        series: series.map(({ countries, ...row }) => row),
+        series: series.map(({
+            countries,
+            response_statuses,
+            content_types,
+            browsers,
+            ssl_protocols,
+            ip_classes,
+            ...row
+        }) => row),
 
         breakdown: {
-            countries: Array.from(countryTotals.entries())
-                .map(([name, value]) => ({
-                    name,
-                    value
-                }))
-                .sort((a, b) => b.value - a.value)
-                .slice(0, 10)
+            countries: aggregateBreakdown(
+                series, 'countries', 'name', 'requests'
+            ),
+
+            response_statuses: aggregateBreakdown(
+                series, 'response_statuses', 'name', 'requests'
+            ),
+
+            content_types: aggregateBreakdown(
+                series, 'content_types', 'name', 'requests'
+            ),
+
+            browsers: aggregateBreakdown(
+                series, 'browsers', 'name', 'pageviews'
+            ),
+
+            ssl_protocols: aggregateBreakdown(
+                series, 'ssl_protocols', 'name', 'requests'
+            ),
+
+            ip_classes: aggregateBreakdown(
+                series, 'ip_classes', 'name', 'requests'
+            )
         }
     };
 }
@@ -347,7 +501,11 @@ async function getWorkersMetrics(apiToken, accountId, dates) {
 
         return {
             requests: toNumber(row.sum?.requests),
-            errors: toNumber(row.sum?.errors)
+            errors: toNumber(row.sum?.errors),
+            subrequests: toNumber(row.sum?.subrequests),
+            cpu_time_us: toNumber(row.sum?.cpuTimeUs),
+            wall_time: toNumber(row.sum?.wallTime),
+            response_body_bytes: toNumber(row.sum?.responseBodySize)
         };
 
     } catch (error) {
@@ -613,6 +771,32 @@ async function handleStats(req, res, userId) {
             db.collection("users").doc(userId).get(),
             db.collection("utenti_dashboard").doc(userId).get()
         ]);
+
+    const dashboardUser = dashboardSnapshot.exists
+        ? dashboardSnapshot.data() || {}
+        : {};
+    
+    const statsMode = dashboardUser.stats_access_mode || 'automatico';
+    
+    const projectPhase = Number(
+        dashboardUser.pagamenti?.progetto?.fase ?? 0
+    );
+    
+    const canViewStats =
+        statsMode === 'mostra' ||
+        (
+            statsMode !== 'nascondi' &&
+            Number.isFinite(projectPhase) &&
+            projectPhase >= 3
+        );
+    
+    if (!canViewStats) {
+        return sendJson(res, 403, {
+            success: false,
+            error: 'Le statistiche non sono abilitate per questo account.'
+        });
+    }
+    
 
     if (!dashboardSnapshot.exists && !privateSnapshot.exists) {
         return sendJson(res, 404, {
