@@ -43,6 +43,7 @@ const USER_FIELDS = new Set([
     'ruolo',
     'stato_sito',
     'stato_progetto',
+    'stats_access_mode',
     'telefono',
     'url_sito',
     'sito_web',
@@ -116,6 +117,56 @@ function validDocumentId(value) {
         && value.trim().length <= 150
         && !value.includes('/')
         && value.trim() === value;
+}
+
+function normalizeCommunicationLinks(value) {
+    if (value === undefined || value === null) return [];
+
+    if (!Array.isArray(value) || value.length > 3) {
+        throw Object.assign(
+            new Error('Puoi associare al massimo 3 link a una comunicazione.'),
+            { status: 400 }
+        );
+    }
+
+    const links = [];
+
+    for (const item of value) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+            throw Object.assign(
+                new Error('Uno dei link inseriti non è valido.'),
+                { status: 400 }
+            );
+        }
+
+        const url = cleanString(item.url, 1000);
+        if (!url) continue;
+
+        let parsedUrl;
+
+        try {
+            parsedUrl = new URL(url);
+        } catch {
+            throw Object.assign(
+                new Error('Uno dei link inseriti non è un indirizzo valido.'),
+                { status: 400 }
+            );
+        }
+
+        if (parsedUrl.protocol !== 'https:') {
+            throw Object.assign(
+                new Error('I link devono iniziare con https://.'),
+                { status: 400 }
+            );
+        }
+
+        links.push({
+            label: cleanString(item.label, 80) || 'Apri link',
+            url: parsedUrl.toString()
+        });
+    }
+
+    return links;
 }
 
 function isValidDateOnly(value) {
@@ -200,6 +251,18 @@ function pickUserFields(source, creating = false) {
 
     for (const [key, value] of Object.entries(source)) {
         if (!USER_FIELDS.has(key)) continue;
+        if (key === 'stats_access_mode') {
+        const mode = cleanString(value, 20).toLowerCase();
+            if (!['automatico', 'mostra', 'nascondi'].includes(mode)) {
+                throw Object.assign(
+                    new Error('Modalità di accesso alle statistiche non valida.'),
+                    { status: 400 }
+                );
+            }
+        result[key] = mode;
+        continue;
+    }
+
         if (typeof value === 'string') {
             result[key] = cleanString(value, 2000);
         } else if (value === null && !creating) {
@@ -481,6 +544,7 @@ module.exports = async function handler(req, res) {
         if (action === 'create_communication') {
             const title = cleanString(body.title, 150);
             const message = cleanString(body.message, 5000);
+            const links = normalizeCommunicationLinks(body.links);
             const targetType = cleanString(body.targetType, 20);
             const targetUid = cleanString(body.targetUid, 150);
         
@@ -526,6 +590,7 @@ module.exports = async function handler(req, res) {
                 message,
                 targetType,
                 targetUid: recipientUid,
+                links,
                 published: true,
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 createdBy: adminUser.uid
@@ -537,6 +602,111 @@ module.exports = async function handler(req, res) {
             });
         }
         
+        if (action === 'update_communication') {
+            const communicationId = cleanString(body.communicationId, 150);
+            const title = cleanString(body.title, 150);
+            const message = cleanString(body.message, 5000);
+            const targetType = cleanString(body.targetType, 20);
+            const targetUid = cleanString(body.targetUid, 150);
+            const links = normalizeCommunicationLinks(body.links);
+
+            if (!validDocumentId(communicationId)) {
+                return sendJson(res, 400, {
+                    error: 'ID comunicazione non valido.'
+                });
+            }
+
+            if (!title || !message) {
+                return sendJson(res, 400, {
+                    error: 'Inserisci un titolo e un messaggio.'
+                });
+            }
+
+            if (!['all', 'user'].includes(targetType)) {
+                return sendJson(res, 400, {
+                    error: 'Destinatario non valido.'
+                });
+            }
+
+            let recipientUid = null;
+
+            if (targetType === 'user') {
+                if (!validDocumentId(targetUid)) {
+                    return sendJson(res, 400, {
+                        error: 'Seleziona un cliente valido.'
+                    });
+                }
+
+                const userSnapshot = await db
+                    .collection('utenti_dashboard')
+                    .doc(targetUid)
+                    .get();
+
+                if (!userSnapshot.exists) {
+                    return sendJson(res, 404, {
+                        error: 'Cliente non trovato.'
+                    });
+                }
+
+                recipientUid = targetUid;
+            }
+
+            const communicationRef = db
+                .collection('comunicazioni')
+                .doc(communicationId);
+
+            const existing = await communicationRef.get();
+
+            if (!existing.exists) {
+                return sendJson(res, 404, {
+                    error: 'Comunicazione non trovata.'
+                });
+            }
+
+            await communicationRef.update({
+                title,
+                message,
+                targetType,
+                targetUid: recipientUid,
+                links,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            return sendJson(res, 200, {
+                success: true,
+                id: communicationId
+            });
+        }
+
+
+        if (action === 'delete_communication') {
+            const communicationId = cleanString(body.communicationId, 150);
+
+            if (!validDocumentId(communicationId)) {
+                return sendJson(res, 400, {
+                    error: 'ID comunicazione non valido.'
+                });
+            }
+
+            const communicationRef = db
+                .collection('comunicazioni')
+                .doc(communicationId);
+
+            const existing = await communicationRef.get();
+
+            if (!existing.exists) {
+                return sendJson(res, 404, {
+                    error: 'Comunicazione non trovata.'
+                });
+            }
+
+            await communicationRef.delete();
+
+            return sendJson(res, 200, {
+                success: true
+            });
+        }
+
         if (action === 'get_collection') {
             const collectionName = cleanString(body.collection, 100);
 
