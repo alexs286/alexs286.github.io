@@ -331,16 +331,25 @@ module.exports = async function handler(req, res) {
         });
 
     } catch (error) {
+        const googleError = error.response?.data?.error
+            || error.response?.data
+            || error.message;
         console.error(
-            'Firestore statistics API error:',
-            error.response?.data || error.message
+            'FIRESTORE GOOGLE API ERROR:',
+            JSON.stringify({
+                status: error.response?.status || error.status,
+                code: googleError?.code,
+                message: googleError?.message || googleError,
+                details: googleError?.details,
+                errors: googleError?.errors
+            }, null, 2)
         );
 
         const googleStatus = error.response?.status || error.status;
 
         if (googleStatus === 403) {
             return sendJson(res, 502, {
-                error: 'Google Cloud ha negato l’accesso. Controlla che Cloud Monitoring API sia attiva e che il Service Account abbia il ruolo Monitoring Viewer.'
+                error: 'Google Cloud ha negato l’accesso.'
             });
         }
 
