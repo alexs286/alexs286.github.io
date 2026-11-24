@@ -6,7 +6,7 @@ const https = require("node:https");
 
 const ALLOWED_ORIGIN = "https://www.creatorweb.cc";
 const GRAPHQL_URL = "https://api.cloudflare.com/client/v4/graphql";
-const ALLOWED_RANGES = new Set(["7d", "30d", "90d"]);
+const ALLOWED_RANGES = new Set(["24h", "7d", "30d", "90d"]);
 const RATE_LIMIT_WINDOW_MS = 60000;
 const RATE_LIMIT_MAX = 30;
 const rateLimits = new Map();
@@ -40,6 +40,74 @@ query CreatorWebZoneAnalytics($zoneTag: string, $start: Date, $end: Date) {
             ) {
                 dimensions {
                     date
+                }
+
+                sum {
+                    requests
+                    bytes
+                    pageViews
+
+                    cachedRequests
+                    cachedBytes
+
+                    encryptedRequests
+                    encryptedBytes
+
+                    countryMap {
+                        clientCountryName
+                        requests
+                        bytes
+                    }
+
+                    responseStatusMap {
+                        edgeResponseStatus
+                        requests
+                    }
+
+                    contentTypeMap {
+                        edgeResponseContentTypeName
+                        requests
+                        bytes
+                    }
+
+                    browserMap {
+                        uaBrowserFamily
+                        pageViews
+                    }
+
+                    clientSSLMap {
+                        clientSSLProtocol
+                        requests
+                    }
+
+                    ipClassMap {
+                        ipType
+                        requests
+                    }
+                }
+
+                uniq {
+                    uniques
+                }
+            }
+        }
+    }
+}`;
+
+const ZONE_ANALYTICS_HOURLY_QUERY = `
+query CreatorWebZoneHourlyAnalytics($zoneTag: string, $start: Time, $end: Time) {
+    viewer {
+        zones(filter: { zoneTag: $zoneTag }) {
+            httpRequests1hGroups(
+                limit: 100
+                orderBy: [datetime_ASC]
+                filter: {
+                    datetime_geq: $start
+                    datetime_lt: $end
+                }
+            ) {
+                dimensions {
+                    datetime
                 }
 
                 sum {
@@ -221,11 +289,22 @@ function getCloudflareConfig(user) {
 
 
 function getRangeDates(range) {
+    const now = new Date();
+
+    if (range === "24h") {
+        const start = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+        return {
+            start: start.toISOString().slice(0, 10),
+            end: now.toISOString().slice(0, 10),
+            startDateTime: start.toISOString(),
+            endDateTime: now.toISOString()
+        };
+    }
+
     const days = Number(range.slice(0, -1));
 
-    const now = new Date();
     const start = new Date(now);
-
     start.setUTCDate(start.getUTCDate() - (days - 1));
 
     const end = new Date(now);
@@ -377,7 +456,7 @@ function normalizeAnalytics(records) {
             }
 
             return {
-                date: record.dimensions?.date || null,
+                date: record.dimensions?.datetime || record.dimensions?.date || null,
 
                 requests: toNumber(sum.requests),
                 pageviews: toNumber(sum.pageViews),
@@ -830,13 +909,25 @@ async function handleStats(req, res, userId) {
 
     const dates = getRangeDates(range);
 
+    const isHourlyRange = range === "24h";
+
     const data = await cloudflareGraphQL(
         cloudflare.apiToken,
-        ZONE_ANALYTICS_QUERY,
+
+        isHourlyRange
+            ? ZONE_ANALYTICS_HOURLY_QUERY
+            : ZONE_ANALYTICS_QUERY,
+
         {
             zoneTag: cloudflare.zoneId,
-            start: dates.start,
-            end: dates.end
+
+            start: isHourlyRange
+                ? dates.startDateTime
+                : dates.start,
+
+            end: isHourlyRange
+                ? dates.endDateTime
+                : dates.end
         }
     );
 
@@ -850,7 +941,9 @@ async function handleStats(req, res, userId) {
     }
 
     const analytics = normalizeAnalytics(
-        zone.httpRequests1dGroups
+        isHourlyRange
+            ? zone.httpRequests1hGroups
+            : zone.httpRequests1dGroups
     );
 
     const workers = await getWorkersMetrics(
@@ -867,8 +960,9 @@ async function handleStats(req, res, userId) {
         breakdown: analytics.breakdown,
         workers,
 
-        unique_visitors_note:
-            "Somma dei visitatori unici giornalieri; uno stesso visitatore può essere contato in più giorni.",
+        unique_visitors_note: isHourlyRange
+            ? "Somma dei visitatori unici per fascia oraria; lo stesso visitatore può essere contato in più ore."
+            : "Somma dei visitatori unici giornalieri; uno stesso visitatore può essere contato in più giorni.",
 
         updated_at: new Date().toISOString()
     });
