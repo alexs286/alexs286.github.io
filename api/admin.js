@@ -736,6 +736,37 @@ module.exports = async function handler(req, res) {
             });
         }
 
+        if (action === 'update_form_block') {
+        
+            const enabled = body.enabled;
+
+            if (typeof enabled !== 'boolean') {
+                return sendJson(res, 400, {
+                    error: 'Valore del blocco non valido.'
+                });
+            }
+
+            await db
+                .collection('stato del servizio')
+                .doc('current_status')
+                .set({
+                
+                    limite_clienti_attivo: enabled,
+
+                    limite_clienti_aggiornato_il:
+                        admin.firestore.FieldValue.serverTimestamp()
+
+                }, {
+                    merge: true
+                });
+
+            return sendJson(res, 200, {
+                success: true,
+                enabled
+            });
+
+        }
+
         if (action === 'configure_project_payment') {
             const userId = body.userId;
             if (!validDocumentId(userId)) {
