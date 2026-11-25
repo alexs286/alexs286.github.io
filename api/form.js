@@ -1,63 +1,156 @@
-import admin from 'firebase-admin';
+const admin = require('firebase-admin');
 
-if (!admin.apps.length) {
-  try {
-    const serviceAccount = typeof process.env.FIREBASE_SERVICE_ACCOUNT_WORK === 'string'
-      ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_WORK)
-      : process.env.FIREBASE_SERVICE_ACCOUNT_WORK;
+const ALLOWED_ORIGINS = new Set([
+    'https://creatorweb.cc',
+    'https://www.creatorweb.cc'
+]);
 
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-  } catch (error) {
-    console.error('Errore durante l\'inizializzazione dei dati:', error);
-  }
-}
+let db;
 
-const db = admin.firestore();
+try {
+    const rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_WORK;
 
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Credentials', true);
-  res.setHeader('Access-Control-Allow-Origin', 'https://www.creatorweb.cc');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
-  );
-
-  if (req.method === 'OPTIONS') {
-    res.status(200).end();
-    return;
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Metodo non consentito. Utilizzare POST.' });
-  }
-
-  try {
-    const { content } = req.body;
-
-    if (!content) {
-      return res.status(400).json({ error: 'Payload del form vuoto o non valido.' });
+    if (!rawServiceAccount) {
+        throw new Error('Missing FIREBASE_SERVICE_ACCOUNT_WORK');
     }
 
-    const parsedData = typeof content === 'string' ? JSON.parse(content) : content;
+    const serviceAccount = typeof rawServiceAccount === 'string'
+        ? JSON.parse(rawServiceAccount)
+        : rawServiceAccount;
 
-    const docData = {
-      ...parsedData,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    };
+    if (!admin.apps.length) {
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+    }
 
-    const docRef = await db.collection('richieste_preventivo').add(docData);
+    db = admin.firestore();
 
-    return res.status(200).json({
-      success: true,
-      message: 'Richiesta ricevuta e salvata con successo!',
-      id: docRef.id
-    });
+} catch (error) {
+    console.error('Firebase initialization error:', error);
+}
 
-  } catch (error) {
-    console.error('Errore durante il salvataggio dei dati:', error);
-    return res.status(500).json({ error: 'Errore interno del server durante il salvataggio.' });
-  }
+export default async function handler(req, res) {
+
+    const origin = req.headers.origin;
+
+    if (origin && !ALLOWED_ORIGINS.has(origin)) {
+        return res.status(403).json({
+            error: 'Origin non autorizzata'
+        });
+    }
+
+    res.setHeader(
+        'Access-Control-Allow-Origin',
+        origin || 'https://www.creatorweb.cc'
+    );
+
+    res.setHeader(
+        'Access-Control-Allow-Methods',
+        'GET, POST, OPTIONS'
+    );
+
+    res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Content-Type'
+    );
+
+    res.setHeader('Access-Control-Max-Age', '86400');
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+
+    if (req.method === 'OPTIONS') {
+        return res.status(204).end();
+    }
+
+    if (!db) {
+        return res.status(500).json({
+            error: 'Database uninitialized'
+        });
+    }
+
+    try {
+
+
+        if (req.method === 'GET') {
+
+            const statusSnapshot = await db
+                .collection('stato del servizio')
+                .doc('current_status')
+                .get();
+
+            const statusData = statusSnapshot.exists
+                ? statusSnapshot.data()
+                : {};
+
+            return res.status(200).json({
+                blocked: statusData.limite_clienti_attivo === true
+            });
+        }
+
+
+        if (req.method === 'POST') {
+
+            const content = req.body?.content;
+
+            if (!content || typeof content !== 'string') {
+                return res.status(400).json({
+                    error: 'Invalid content format'
+                });
+            }
+
+            if (content.length > 50000) {
+                return res.status(413).json({
+                    error: 'Payload limits exceeded'
+                });
+            }
+
+
+            const statusSnapshot = await db
+                .collection('stato del servizio')
+                .doc('current_status')
+                .get();
+
+            const statusData = statusSnapshot.exists
+                ? statusSnapshot.data()
+                : {};
+
+            if (statusData.limite_clienti_attivo === true) {
+
+                return res.status(503).json({
+                    success: false,
+                    code: 'REQUESTS_DISABLED',
+                    error: 'Le nuove richieste sono temporaneamente sospese.'
+                });
+
+            }
+
+            const collectionRef = db.collection('form_richieste');
+
+            const newDoc = await collectionRef.add({
+                content,
+                timestamp: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            return res.status(200).json({
+                id: newDoc.id,
+                success: true
+            });
+        }
+
+
+        res.setHeader('Allow', ['GET', 'POST', 'OPTIONS']);
+
+        return res.status(405).end();
+
+
+    } catch (error) {
+
+        console.error('Form API error:', error);
+
+        return res.status(500).json({
+            error: 'Errore durante la gestione della richiesta.'
+        });
+
+    }
 }
