@@ -4,7 +4,7 @@ const net = require("node:net");
 const http = require("node:http");
 const https = require("node:https");
 
-const ALLOWED_ORIGIN = "https://www.creatorweb.cc";
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://www.creatorweb.cc";
 const GRAPHQL_URL = "https://api.cloudflare.com/client/v4/graphql";
 const ALLOWED_RANGES = new Set(["24h", "7d", "30d", "90d"]);
 const RATE_LIMIT_WINDOW_MS = 60000;
@@ -890,20 +890,14 @@ async function handleStats(req, res, userId) {
 
     const cloudflare = getCloudflareConfig(privateUser);
 
-    if (
+        if (
         !cloudflare.apiToken ||
         !cloudflare.accountId ||
         !cloudflare.zoneId
     ) {
         return sendJson(res, 409, {
             success: false,
-            error: "Cloudflare configuration incomplete",
-
-            required_fields: [
-                "users/{userId}.cloudflare.api_token",
-                "users/{userId}.cloudflare.account_id",
-                "users/{userId}.cloudflare.zone_id"
-            ]
+            error: "La configurazione Cloudflare per questo account è incompleta."
         });
     }
 
@@ -1082,18 +1076,19 @@ module.exports = async (req, res) => {
         });
 
 
-    } catch (error) {
+        } catch (error) {
         console.error("Cloudflare API error:", {
             message: error.message,
             stack: error.stack
         });
     
+        const isDev = process.env.NODE_ENV === "development";
         return sendJson(res, 502, {
             success: false,
             error: action === "stats"
-                ? "Unable to retrieve Cloudflare statistics"
-                : "Unable to check website availability",
-            details: error.message
+                ? "Impossibile recuperare le statistiche Cloudflare"
+                : "Impossibile verificare la disponibilità del sito web",
+            ...(isDev ? { details: error.message } : {})
         });
     }
 };
