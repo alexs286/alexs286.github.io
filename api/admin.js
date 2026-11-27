@@ -1,31 +1,13 @@
+'use strict';
+
 const admin = require('firebase-admin');
 const crypto = require('crypto');
 
-if (!admin.apps.length) {
-    const rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_WORK;
+const ALLOWED_ORIGINS = new Set([
+    'https://creatorweb.cc',
+    'https://www.creatorweb.cc'
+]);
 
-    if (!rawServiceAccount) {
-        throw new Error('Missing FIREBASE_SERVICE_ACCOUNT_WORK');
-    }
-
-    let serviceAccount;
-    try {
-        serviceAccount = typeof rawServiceAccount === 'string'
-            ? JSON.parse(rawServiceAccount)
-            : rawServiceAccount;
-    } catch (error) {
-        throw new Error('FIREBASE_SERVICE_ACCOUNT_WORK non contiene un JSON valido');
-    }
-
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-    });
-}
-
-const db = admin.firestore();
-const rateLimits = new Map();
-
-const ALLOWED_ORIGINS = new Set(['https://creatorweb.cc', 'https://www.creatorweb.cc']);
 const ALLOWED_COLLECTIONS = new Set([
     'richieste_preventivo',
     'utenti_dashboard',
@@ -62,9 +44,52 @@ const STATUS_VALUES = new Set([
     'manutenzione'
 ]);
 
+const MANDATORY_EMAIL_URLS = [
+    'https://creatorweb.cc',
+    'https://creatorweb.cc/dashboard',
+    'https://creatorweb.cc/faq',
+    'https://creatorweb.cc/termini',
+    'https://creatorweb.cc/privacy'
+];
+
+const MANDATORY_NON_MARKETING_TEXT = 'questa email non è a scopo di marketing';
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function httpError(status, message) {
+    const err = new Error(message);
+    err.status = status;
+    return err;
+}
+
+function initFirebase() {
+    if (admin.apps.length) return;
+
+    const rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_WORK;
+    if (!rawServiceAccount) {
+        throw new Error('Missing FIREBASE_SERVICE_ACCOUNT_WORK');
+    }
+
+    let serviceAccount;
+    try {
+        serviceAccount = typeof rawServiceAccount === 'string'
+            ? JSON.parse(rawServiceAccount)
+            : rawServiceAccount;
+    } catch {
+        throw new Error('FIREBASE_SERVICE_ACCOUNT_WORK non contiene un JSON valido');
+    }
+
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+    });
+}
+
+initFirebase();
+
+const db = admin.firestore();
+const rateLimits = new Map();
+
 function setCors(req, res) {
     const origin = req.headers.origin;
-
     if (!origin || ALLOWED_ORIGINS.has(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin || 'https://www.creatorweb.cc');
     }
@@ -87,28 +112,36 @@ function checkRateLimit(req) {
         || 'unknown';
 
     const now = Date.now();
+    const windowMs = 60_000;
+    const maxRequests = 100;
     const current = rateLimits.get(ip) || { count: 0, startedAt: now };
 
-    if (now - current.startedAt >= 60000) {
+    if (now - current.startedAt >= windowMs) {
         current.count = 0;
         current.startedAt = now;
     }
 
-    current.count++;
+    current.count += 1;
     rateLimits.set(ip, current);
 
     if (rateLimits.size > 5000) {
-        for (const [key, value] of rateLimits) {
-            if (now - value.startedAt >= 60000) rateLimits.delete(key);
+        for (const [key, value] of rateLimits.entries()) {
+            if (now - value.startedAt >= windowMs) {
+                rateLimits.delete(key);
+            }
         }
     }
 
-    return current.count > 100;
+    return current.count > maxRequests;
 }
 
 function cleanString(value, maxLength = 5000) {
     if (typeof value !== 'string') return '';
     return value.trim().slice(0, maxLength);
+}
+
+function isValidEmail(email) {
+    return typeof email === 'string' && email.length <= 254 && EMAIL_REGEX.test(email);
 }
 
 function validDocumentId(value) {
@@ -119,45 +152,70 @@ function validDocumentId(value) {
         && value.trim() === value;
 }
 
+function escapeHtml(text) {
+    return String(text || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function buildFallbackEmailHtml({ standardText, extraText, rawHtml }) {
+    const trimmedHtml = cleanString(rawHtml, 100_000);
+    if (trimmedHtml) return trimmedHtml;
+
+    const parts = [standardText, extraText]
+        .map(part => cleanString(part, 5000))
+        .filter(Boolean)
+        .map(part => `<p style="margin:0 0 12px;line-height:1.5;">${escapeHtml(part).replace(/\n/g, '<br>')}</p>`);
+
+    return parts.join('\n');
+}
+
+function ensureRequiredEmailFooter(html) {
+    let output = String(html || '');
+    const missingLinks = MANDATORY_EMAIL_URLS.filter(url => !output.includes(url));
+    const missingNotice = !output.toLowerCase().includes(MANDATORY_NON_MARKETING_TEXT);
+
+    if (missingLinks.length > 0 || missingNotice) {
+        const linksBlock = missingLinks
+            .map(url => `<a href="${url}" style="margin-right:10px;">${url}</a>`)
+            .join('');
+        const noticeBlock = missingNotice
+            ? `<p style="margin:6px 0 0;font-size:12px;font-weight:600;">${MANDATORY_NON_MARKETING_TEXT}</p>`
+            : '';
+        output += `<div style="margin-top:16px;padding-top:12px;border-top:1px solid #e2e8f0;font-size:12px;">${linksBlock}${noticeBlock}</div>`;
+    }
+
+    return output;
+}
+
 function normalizeCommunicationLinks(value) {
     if (value === undefined || value === null) return [];
 
     if (!Array.isArray(value) || value.length > 3) {
-        throw Object.assign(
-            new Error('Puoi associare al massimo 3 link a una comunicazione.'),
-            { status: 400 }
-        );
+        throw httpError(400, 'Puoi associare al massimo 3 link a una comunicazione.');
     }
 
     const links = [];
-
     for (const item of value) {
         if (!item || typeof item !== 'object' || Array.isArray(item)) {
-            throw Object.assign(
-                new Error('Uno dei link inseriti non è valido.'),
-                { status: 400 }
-            );
+            throw httpError(400, 'Uno dei link inseriti non è valido.');
         }
 
         const url = cleanString(item.url, 1000);
         if (!url) continue;
 
         let parsedUrl;
-
         try {
             parsedUrl = new URL(url);
         } catch {
-            throw Object.assign(
-                new Error('Uno dei link inseriti non è un indirizzo valido.'),
-                { status: 400 }
-            );
+            throw httpError(400, 'Uno dei link inseriti non è un indirizzo valido.');
         }
 
         if (parsedUrl.protocol !== 'https:') {
-            throw Object.assign(
-                new Error('I link devono iniziare con https://.'),
-                { status: 400 }
-            );
+            throw httpError(400, 'I link devono iniziare con https://.');
         }
 
         links.push({
@@ -198,6 +256,7 @@ function serializeData(value) {
 function redactSensitiveFields(value) {
     if (Array.isArray(value)) return value.map(redactSensitiveFields);
     if (!value || typeof value !== 'object') return value;
+
     const result = {};
     for (const [key, child] of Object.entries(value)) {
         if (['password', 'passwordHash', 'codici_sicurezza_hash'].includes(key)) continue;
@@ -209,11 +268,8 @@ function redactSensitiveFields(value) {
 async function verifyAdmin(req) {
     const header = req.headers.authorization || '';
     const match = header.match(/^Bearer\s+(.+)$/i);
-
     if (!match) {
-        const error = new Error('Autenticazione richiesta. Effettua nuovamente l’accesso.');
-        error.status = 401;
-        throw error;
+        throw httpError(401, 'Autenticazione richiesta. Effettua nuovamente l’accesso.');
     }
 
     const allowedUids = (process.env.ADMIN_UIDS || '')
@@ -222,27 +278,51 @@ async function verifyAdmin(req) {
         .filter(Boolean);
 
     if (allowedUids.length === 0) {
-        const error = new Error('Configurazione amministratore mancante sul server.');
-        error.status = 503;
-        throw error;
+        throw httpError(503, 'Configurazione amministratore mancante sul server.');
     }
 
     let decoded;
     try {
         decoded = await admin.auth().verifyIdToken(match[1], true);
-    } catch (_error) {
-        const error = new Error('Sessione non valida o scaduta.');
-        error.status = 401;
-        throw error;
+    } catch {
+        throw httpError(401, 'Sessione non valida o scaduta.');
     }
 
     if (!allowedUids.includes(decoded.uid)) {
-        const error = new Error('Non hai i permessi per accedere al pannello amministrativo.');
-        error.status = 403;
-        throw error;
+        throw httpError(403, 'Non hai i permessi per accedere al pannello amministrativo.');
     }
 
     return decoded;
+}
+
+async function getUserProfileOrThrow(userId) {
+    if (!validDocumentId(userId)) {
+        throw httpError(400, 'ID utente non valido.');
+    }
+
+    const ref = db.collection('utenti_dashboard').doc(userId);
+    const snap = await ref.get();
+    if (!snap.exists) {
+        throw httpError(404, 'Profilo cliente non trovato.');
+    }
+
+    return { ref, snap, data: snap.data() || {} };
+}
+
+async function assertActiveAuthUser(uid) {
+    try {
+        const authUser = await admin.auth().getUser(uid);
+        if (authUser.disabled) {
+            throw httpError(409, 'L’account Firebase del cliente è disabilitato.');
+        }
+        return authUser;
+    } catch (error) {
+        if (error.status) throw error;
+        if (error.code === 'auth/user-not-found') {
+            throw httpError(409, 'Prima migra questo profilo collegandolo a un account Firebase Authentication.');
+        }
+        throw error;
+    }
 }
 
 function pickUserFields(source, creating = false) {
@@ -251,17 +331,15 @@ function pickUserFields(source, creating = false) {
 
     for (const [key, value] of Object.entries(source)) {
         if (!USER_FIELDS.has(key)) continue;
+
         if (key === 'stats_access_mode') {
-        const mode = cleanString(value, 20).toLowerCase();
+            const mode = cleanString(value, 20).toLowerCase();
             if (!['automatico', 'mostra', 'nascondi'].includes(mode)) {
-                throw Object.assign(
-                    new Error('Modalità di accesso alle statistiche non valida.'),
-                    { status: 400 }
-                );
+                throw httpError(400, 'Modalità di accesso alle statistiche non valida.');
             }
-        result[key] = mode;
-        continue;
-    }
+            result[key] = mode;
+            continue;
+        }
 
         if (typeof value === 'string') {
             result[key] = cleanString(value, 2000);
@@ -272,19 +350,327 @@ function pickUserFields(source, creating = false) {
 
     if (typeof result.email === 'string') {
         result.email = result.email.toLowerCase();
+        if (result.email && !isValidEmail(result.email)) {
+            throw httpError(400, 'Indirizzo email non valido.');
+        }
     }
 
     if (typeof result.nome_utente === 'string') {
         result.nome_utente = result.nome_utente.toLowerCase();
     }
 
-
     if (Object.prototype.hasOwnProperty.call(result, 'scadenza_dominio')
         && !isValidDateOnly(result.scadenza_dominio)) {
-        throw Object.assign(new Error('La scadenza del dominio deve essere una data valida (AAAA-MM-GG).'), { status: 400 });
+        throw httpError(400, 'La scadenza del dominio deve essere una data valida (AAAA-MM-GG).');
     }
 
     return result;
+}
+
+function signEmailAudit(payloadObj) {
+    const secret = process.env.ACCEPTANCE_AUDIT_SECRET;
+    if (!secret || typeof secret !== 'string' || secret.trim().length < 16) {
+        throw httpError(503, 'Configurazione ACCEPTANCE_AUDIT_SECRET mancante o non valida sul server.');
+    }
+    return crypto
+        .createHmac('sha256', secret.trim())
+        .update(JSON.stringify(payloadObj))
+        .digest('hex');
+}
+
+async function sendViaResend({ to, subject, html, attachment }) {
+    const apiKey = process.env.RESEND_API_KEY;
+    const fromEmail = process.env.RESEND_FROM_EMAIL;
+
+    if (!apiKey || !fromEmail) {
+        throw httpError(503, 'Configurazione RESEND_API_KEY o RESEND_FROM_EMAIL mancante sul server.');
+    }
+
+    const bodyPayload = {
+        from: cleanString(fromEmail, 254),
+        to: Array.isArray(to) ? to : [to],
+        subject: cleanString(subject, 200),
+        html: ensureRequiredEmailFooter(html)
+    };
+
+    if (attachment && typeof attachment === 'object') {
+        const filename = cleanString(attachment.filename, 180);
+        const base64Content = typeof attachment.base64Content === 'string'
+            ? attachment.base64Content.replace(/\s+/g, '')
+            : '';
+
+        if (filename && base64Content) {
+            const approxBytes = Math.floor((base64Content.length * 3) / 4);
+            if (approxBytes > 5 * 1024 * 1024) {
+                throw httpError(400, 'Allegato troppo grande (limite 5 MB).');
+            }
+            bodyPayload.attachments = [{
+                filename,
+                content: base64Content
+            }];
+        }
+    }
+
+    const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${apiKey.trim()}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(bodyPayload)
+    });
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const status = response.status >= 400 && response.status < 600 ? response.status : 502;
+        throw httpError(status, data.message || data.error || `Errore Resend HTTP ${response.status}`);
+    }
+
+    return data;
+}
+
+async function handleCreateQuote(req, res, adminUser) {
+    const body = req.body;
+    const input = body.quote && typeof body.quote === 'object' && !Array.isArray(body.quote)
+        ? body.quote
+        : {};
+    const suppliedDocument = input.document && typeof input.document === 'object' && !Array.isArray(input.document)
+        ? input.document
+        : {};
+    const rawFields = suppliedDocument.fields && typeof suppliedDocument.fields === 'object'
+        ? suppliedDocument.fields
+        : {};
+    const rawItems = Array.isArray(suppliedDocument.items)
+        ? suppliedDocument.items
+        : (Array.isArray(input.items) ? input.items : []);
+
+    const fieldLimits = {
+        clientType: 30, quoteNumber: 50, quoteDate: 10, validUntil: 10,
+        clientName: 160, clientContact: 160, clientEmail: 254, clientPhone: 80,
+        clientAddress: 500, clientCity: 200, clientCountry: 100, clientVat: 50,
+        projectTitle: 180, projectObject: 3000, projectDescription: 5000,
+        included: 5000, excluded: 5000, clientDuties: 3000,
+        duration: 300, deliveryDate: 200, revisions: 200, deliveryMethod: 1000,
+        extraSpecs: 3000, grandTotal: 30, thirdPartyCosts: 2500,
+        paymentMethod: 100, paymentTerms: 2000, paymentDetails: 3000,
+        recurringPlan: 30, recurringTerms: 4000,
+        changesTerms: 4000, delayTerms: 4000, ownershipTerms: 4000,
+        hostingTerms: 4000, backupExitTerms: 4000, supportTerms: 4000,
+        confidentialityTerms: 3000, privacyTerms: 3000, otherTerms: 3000,
+        withdrawalText: 4000, withdrawalEmail: 254,
+        acceptanceText: 3000, specificApproval: 4000, finalNotes: 3000
+    };
+
+    const fields = {};
+    for (const [key, maxLength] of Object.entries(fieldLimits)) {
+        if (typeof rawFields[key] === 'string') {
+            fields[key] = cleanString(rawFields[key], maxLength);
+        }
+    }
+    fields.useItemPricing = rawFields.useItemPricing === true;
+
+    const clientName = cleanString(fields.clientName || input.clientName, 160);
+    const clientEmail = cleanString(fields.clientEmail || input.clientEmail, 254).toLowerCase();
+    const rawClientType = cleanString(fields.clientType || input.clientType, 30).toLowerCase();
+    const clientType = rawClientType === 'consumer'
+        ? 'consumer'
+        : (['business', 'professional'].includes(rawClientType) ? 'professional' : '');
+    const clientAddress = cleanString(fields.clientAddress || input.clientAddress, 500);
+    const projectTitle = cleanString(fields.projectTitle || input.projectTitle, 180);
+    const description = cleanString(fields.projectDescription || fields.projectObject || input.description, 5000);
+    const included = cleanString(fields.included || input.included, 5000);
+    const excluded = cleanString(fields.excluded || input.excluded, 5000);
+    const timeline = [
+        fields.duration ? `Tempistica indicativa: ${fields.duration}` : '',
+        fields.deliveryDate ? `Data / periodo di consegna: ${fields.deliveryDate}` : '',
+        fields.deliveryMethod ? `Modalità di consegna: ${fields.deliveryMethod}` : '',
+        cleanString(input.timeline, 1500)
+    ].filter(Boolean).join('\n');
+    const paymentTerms = cleanString(fields.paymentTerms || input.paymentTerms, 2000);
+    const revisions = cleanString(fields.revisions || input.revisions || '3 cicli di revisione', 200);
+    const notes = cleanString(fields.otherTerms || fields.finalNotes || input.notes, 3000);
+
+    if (!clientName || !clientEmail || !projectTitle || !description) {
+        return sendJson(res, 400, { error: 'Compila il cliente, l’email, il titolo e la descrizione del progetto.' });
+    }
+    if (!isValidEmail(clientEmail)) {
+        return sendJson(res, 400, { error: 'Indirizzo email del cliente non valido.' });
+    }
+    if (!clientType) {
+        return sendJson(res, 400, { error: 'Indica se il cliente è un consumatore oppure un professionista/impresa.' });
+    }
+    if (rawItems.length > 40) {
+        return sendJson(res, 400, { error: 'Puoi inserire al massimo 40 voci di prestazione.' });
+    }
+
+    const itemPricing = suppliedDocument.itemPricing === true || fields.useItemPricing === true;
+    const items = [];
+    let calculatedCents = 0;
+
+    for (const rawItem of rawItems) {
+        if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) {
+            return sendJson(res, 400, { error: 'Una voce del preventivo non è valida.' });
+        }
+        const itemDescription = cleanString(rawItem.description, 500);
+        if (!itemDescription) continue;
+
+        const quantity = itemPricing ? Number(rawItem.quantity) : 1;
+        const unitPriceCents = itemPricing ? Number(rawItem.unitPriceCents) : 0;
+        if (
+            !Number.isFinite(quantity) || quantity <= 0 || quantity > 1000
+            || Math.abs(quantity * 100 - Math.round(quantity * 100)) > 1e-6
+            || !Number.isSafeInteger(unitPriceCents) || unitPriceCents < 0 || unitPriceCents > 100_000_000
+        ) {
+            return sendJson(res, 400, { error: 'Controlla quantità e prezzo unitario delle prestazioni.' });
+        }
+
+        const lineTotalCents = Math.round(quantity * unitPriceCents);
+        if (!Number.isSafeInteger(lineTotalCents) || !Number.isSafeInteger(calculatedCents + lineTotalCents)) {
+            return sendJson(res, 400, { error: 'Il totale delle prestazioni supera i limiti consentiti.' });
+        }
+
+        calculatedCents += lineTotalCents;
+        items.push({ description: itemDescription, quantity, unitPriceCents, lineTotalCents });
+    }
+
+    let totalCents = Number(input.totalCents);
+    if (!Number.isSafeInteger(totalCents) && fields.grandTotal !== undefined && fields.grandTotal !== '') {
+        const euros = Number(String(fields.grandTotal).replace(',', '.'));
+        if (Number.isFinite(euros)) totalCents = Math.round(euros * 100);
+    }
+    if (!Number.isSafeInteger(totalCents) || totalCents <= 0) {
+        totalCents = itemPricing ? calculatedCents : 0;
+    }
+    if (!Number.isSafeInteger(totalCents) || totalCents <= 0) {
+        return sendJson(res, 400, { error: 'Inserisci un totale preventivo maggiore di zero.' });
+    }
+
+    const now = new Date();
+    const todayIso = now.toISOString().slice(0, 10);
+    let validUntilIso = cleanString(fields.validUntil, 10);
+    if (!isValidDateOnly(validUntilIso) || !validUntilIso) {
+        const fallbackDays = Number(input.validDays || 30);
+        if (!Number.isInteger(fallbackDays) || fallbackDays < 1 || fallbackDays > 90) {
+            return sendJson(res, 400, { error: 'La validità deve essere compresa tra 1 e 90 giorni.' });
+        }
+        validUntilIso = new Date(now.getTime() + fallbackDays * 86_400_000).toISOString().slice(0, 10);
+    }
+
+    const [validYear, validMonth, validDay] = validUntilIso.split('-').map(Number);
+    const validUntil = new Date(Date.UTC(validYear, validMonth - 1, validDay, 23, 59, 59));
+    const todayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    const expiryDayUtc = Date.UTC(validYear, validMonth - 1, validDay);
+    const validDays = Math.round((expiryDayUtc - todayUtc) / 86_400_000) + 1;
+
+    if (!Number.isFinite(validUntil.getTime()) || validUntil.getTime() <= now.getTime() || validDays < 1 || validDays > 90) {
+        return sendJson(res, 400, { error: 'La data di validità deve essere compresa tra oggi e i prossimi 90 giorni.' });
+    }
+
+    fields.clientName = clientName;
+    fields.clientEmail = clientEmail;
+    fields.clientType = clientType;
+    fields.projectTitle = projectTitle;
+    fields.quoteDate = todayIso;
+    fields.validUntil = validUntilIso;
+
+    const providerRaw = suppliedDocument.provider && typeof suppliedDocument.provider === 'object'
+        ? suppliedDocument.provider
+        : {};
+    const provider = {
+        brand: cleanString(providerRaw.brand || 'CreatorWeb', 80),
+        legalName: cleanString(providerRaw.legalName, 200),
+        vatNumber: cleanString(providerRaw.vatNumber, 40),
+        address: cleanString(providerRaw.address, 500),
+        postalCity: cleanString(providerRaw.postalCity, 200),
+        country: cleanString(providerRaw.country || 'Italia', 100),
+        email: cleanString(providerRaw.email, 254),
+        phone: cleanString(providerRaw.phone, 80),
+        website: cleanString(providerRaw.website || 'https://www.creatorweb.cc/', 300)
+    };
+
+    const legalRaw = suppliedDocument.legal && typeof suppliedDocument.legal === 'object'
+        ? suppliedDocument.legal
+        : {};
+    const safeLegalUrl = (value, fallback) => {
+        const url = cleanString(value || fallback, 500);
+        return /^https:\/\/[^\s]+$/i.test(url) ? url : fallback;
+    };
+
+    const legal = {
+        termsUrl: safeLegalUrl(legalRaw.termsUrl, 'https://www.creatorweb.cc/termini.html'),
+        privacyUrl: safeLegalUrl(legalRaw.privacyUrl, 'https://www.creatorweb.cc/privacy.html'),
+        taxStatement: cleanString(legalRaw.taxStatement, 1000)
+    };
+
+    const subscriptionPrices = { Base: 1000, Standard: 2000, Premium: 5000 };
+    const recurringPlan = cleanString(fields.recurringPlan, 30);
+    const recurringPriceCents = Object.prototype.hasOwnProperty.call(subscriptionPrices, recurringPlan)
+        ? subscriptionPrices[recurringPlan]
+        : null;
+
+    const id = crypto.randomBytes(32).toString('hex');
+    const quoteNumber = `CW-${now.getUTCFullYear()}-${id.slice(0, 8).toUpperCase()}`;
+    fields.quoteNumber = quoteNumber;
+
+    const termsVersion = process.env.TERMS_VERSION || '2026-11-12';
+    const siteUrl = (process.env.PUBLIC_SITE_URL || 'https://www.creatorweb.cc').replace(/\/+$/, '');
+    const publicUrl = `${siteUrl}/accettazione/${id}`;
+
+    const documentSnapshot = {
+        fields,
+        items,
+        itemPricing,
+        provider,
+        legal,
+        recurringPriceCents
+    };
+
+    const snapshot = {
+        quoteNumber,
+        client: { name: clientName, email: clientEmail, type: clientType, address: clientAddress },
+        project: { title: projectTitle, description, included, excluded, timeline },
+        items,
+        totalCents,
+        document: documentSnapshot,
+        terms: { paymentTerms, revisions, notes, validDays },
+        termsVersion,
+        termsUrl: legal.termsUrl
+    };
+
+    const quoteHash = crypto.createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
+    const quoteRef = db.collection('preventivi_emessi').doc(id);
+
+    await quoteRef.create({
+        id,
+        quoteNumber,
+        client: snapshot.client,
+        project: snapshot.project,
+        items,
+        totalCents,
+        currency: 'EUR',
+        document: documentSnapshot,
+        terms: snapshot.terms,
+        termsVersion,
+        termsUrl: legal.termsUrl,
+        quoteHash,
+        publicUrl,
+        status: 'pending',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAtIso: now.toISOString(),
+        validUntil: admin.firestore.Timestamp.fromDate(validUntil),
+        validUntilIso: validUntil.toISOString(),
+        createdBy: adminUser.uid
+    });
+
+    return sendJson(res, 201, {
+        success: true,
+        id,
+        quoteNumber,
+        publicUrl,
+        totalCents,
+        validUntil: validUntil.toISOString(),
+        status: 'pending'
+    });
 }
 
 module.exports = async function handler(req, res) {
@@ -308,283 +694,34 @@ module.exports = async function handler(req, res) {
 
     try {
         const adminUser = await verifyAdmin(req);
-
         const body = req.body && typeof req.body === 'object' ? req.body : {};
         const action = cleanString(body.action, 80);
 
-
         if (action === 'create_quote') {
-            const input = body.quote && typeof body.quote === 'object' && !Array.isArray(body.quote)
-                ? body.quote
-                : {};
-            const suppliedDocument = input.document && typeof input.document === 'object' && !Array.isArray(input.document)
-                ? input.document
-                : {};
-            const rawFields = suppliedDocument.fields && typeof suppliedDocument.fields === 'object'
-                ? suppliedDocument.fields
-                : {};
-            const rawItems = Array.isArray(suppliedDocument.items)
-                ? suppliedDocument.items
-                : (Array.isArray(input.items) ? input.items : []);
-
-            const fieldLimits = {
-                clientType: 30, quoteNumber: 50, quoteDate: 10, validUntil: 10,
-                clientName: 160, clientContact: 160, clientEmail: 254, clientPhone: 80,
-                clientAddress: 500, clientCity: 200, clientCountry: 100, clientVat: 50,
-                projectTitle: 180, projectObject: 3000, projectDescription: 5000,
-                included: 5000, excluded: 5000, clientDuties: 3000,
-                duration: 300, deliveryDate: 200, revisions: 200, deliveryMethod: 1000,
-                extraSpecs: 3000, grandTotal: 30, thirdPartyCosts: 2500,
-                paymentMethod: 100, paymentTerms: 2000, paymentDetails: 3000,
-                recurringPlan: 30, recurringTerms: 4000,
-                changesTerms: 4000, delayTerms: 4000, ownershipTerms: 4000,
-                hostingTerms: 4000, backupExitTerms: 4000, supportTerms: 4000,
-                confidentialityTerms: 3000, privacyTerms: 3000, otherTerms: 3000,
-                withdrawalText: 4000, withdrawalEmail: 254,
-                acceptanceText: 3000, specificApproval: 4000, finalNotes: 3000
-            };
-            const fields = {};
-            for (const [key, maxLength] of Object.entries(fieldLimits)) {
-                if (typeof rawFields[key] === 'string') fields[key] = cleanString(rawFields[key], maxLength);
-            }
-            fields.useItemPricing = rawFields.useItemPricing === true;
-
-            const clientName = cleanString(fields.clientName || input.clientName, 160);
-            const clientEmail = cleanString(fields.clientEmail || input.clientEmail, 254).toLowerCase();
-            const rawClientType = cleanString(fields.clientType || input.clientType, 30).toLowerCase();
-            const clientType = rawClientType === 'consumer' ? 'consumer'
-                : (['business', 'professional'].includes(rawClientType) ? 'professional' : '');
-            const clientAddress = cleanString(fields.clientAddress || input.clientAddress, 500);
-            const projectTitle = cleanString(fields.projectTitle || input.projectTitle, 180);
-            const description = cleanString(fields.projectDescription || fields.projectObject || input.description, 5000);
-            const included = cleanString(fields.included || input.included, 5000);
-            const excluded = cleanString(fields.excluded || input.excluded, 5000);
-            const timeline = [
-                fields.duration ? `Tempistica indicativa: ${fields.duration}` : '',
-                fields.deliveryDate ? `Data / periodo di consegna: ${fields.deliveryDate}` : '',
-                fields.deliveryMethod ? `Modalità di consegna: ${fields.deliveryMethod}` : '',
-                cleanString(input.timeline, 1500)
-            ].filter(Boolean).join('\n');
-            const paymentTerms = cleanString(fields.paymentTerms || input.paymentTerms, 2000);
-            const revisions = cleanString(fields.revisions || input.revisions || '3 cicli di revisione', 200);
-            const notes = cleanString(fields.otherTerms || fields.finalNotes || input.notes, 3000);
-
-            if (!clientName || !clientEmail || !projectTitle || !description) {
-                return sendJson(res, 400, { error: 'Compila il cliente, l’email, il titolo e la descrizione del progetto.' });
-            }
-            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clientEmail)) {
-                return sendJson(res, 400, { error: 'Indirizzo email del cliente non valido.' });
-            }
-            if (!clientType) {
-                return sendJson(res, 400, { error: 'Indica se il cliente è un consumatore oppure un professionista/impresa.' });
-            }
-            if (rawItems.length > 40) {
-                return sendJson(res, 400, { error: 'Puoi inserire al massimo 40 voci di prestazione.' });
-            }
-
-            const itemPricing = suppliedDocument.itemPricing === true || fields.useItemPricing === true;
-            const items = [];
-            let calculatedCents = 0;
-            for (const rawItem of rawItems) {
-                if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) {
-                    return sendJson(res, 400, { error: 'Una voce del preventivo non è valida.' });
-                }
-                const itemDescription = cleanString(rawItem.description, 500);
-                if (!itemDescription) continue;
-
-                const quantity = itemPricing ? Number(rawItem.quantity) : 1;
-                const unitPriceCents = itemPricing ? Number(rawItem.unitPriceCents) : 0;
-                if (!Number.isFinite(quantity) || quantity <= 0 || quantity > 1000 ||
-                    Math.abs(quantity * 100 - Math.round(quantity * 100)) > 0.000001 ||
-                    !Number.isSafeInteger(unitPriceCents) || unitPriceCents < 0 || unitPriceCents > 100000000) {
-                    return sendJson(res, 400, { error: 'Controlla quantità e prezzo unitario delle prestazioni.' });
-                }
-
-                const lineTotalCents = Math.round(quantity * unitPriceCents);
-                if (!Number.isSafeInteger(lineTotalCents) || !Number.isSafeInteger(calculatedCents + lineTotalCents)) {
-                    return sendJson(res, 400, { error: 'Il totale delle prestazioni supera i limiti consentiti.' });
-                }
-                calculatedCents += lineTotalCents;
-                items.push({ description: itemDescription, quantity, unitPriceCents, lineTotalCents });
-            }
-
-            let totalCents = Number(input.totalCents);
-            if (!Number.isSafeInteger(totalCents) && fields.grandTotal !== undefined && fields.grandTotal !== '') {
-                const euros = Number(String(fields.grandTotal).replace(',', '.'));
-                if (Number.isFinite(euros)) totalCents = Math.round(euros * 100);
-            }
-            if (!Number.isSafeInteger(totalCents) || totalCents <= 0) {
-                totalCents = itemPricing ? calculatedCents : 0;
-            }
-            if (!Number.isSafeInteger(totalCents) || totalCents <= 0) {
-                return sendJson(res, 400, { error: 'Inserisci un totale preventivo maggiore di zero.' });
-            }
-
-            const now = new Date();
-            const todayIso = now.toISOString().slice(0, 10);
-            let validUntilIso = cleanString(fields.validUntil, 10);
-            if (!isValidDateOnly(validUntilIso) || !validUntilIso) {
-                const fallbackDays = Number(input.validDays || 30);
-                if (!Number.isInteger(fallbackDays) || fallbackDays < 1 || fallbackDays > 90) {
-                    return sendJson(res, 400, { error: 'La validità deve essere compresa tra 1 e 90 giorni.' });
-                }
-                const fallback = new Date(now.getTime() + fallbackDays * 24 * 60 * 60 * 1000);
-                validUntilIso = fallback.toISOString().slice(0, 10);
-            }
-            const [validYear, validMonth, validDay] = validUntilIso.split('-').map(Number);
-            const validUntil = new Date(Date.UTC(validYear, validMonth - 1, validDay, 23, 59, 59));
-            const todayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-            const expiryDayUtc = Date.UTC(validYear, validMonth - 1, validDay);
-            const validDays = Math.round((expiryDayUtc - todayUtc) / 86400000) + 1;
-            if (!Number.isFinite(validUntil.getTime()) || validUntil.getTime() <= now.getTime() ||
-                validDays < 1 || validDays > 90) {
-                return sendJson(res, 400, { error: 'La data di validità deve essere compresa tra oggi e i prossimi 90 giorni.' });
-            }
-
-            fields.clientName = clientName;
-            fields.clientEmail = clientEmail;
-            fields.clientType = clientType;
-            fields.projectTitle = projectTitle;
-            fields.quoteDate = todayIso;
-            fields.validUntil = validUntilIso;
-
-            const providerRaw = suppliedDocument.provider && typeof suppliedDocument.provider === 'object'
-                ? suppliedDocument.provider
-                : {};
-            const provider = {
-                brand: cleanString(providerRaw.brand || 'CreatorWeb', 80),
-                legalName: cleanString(providerRaw.legalName, 200),
-                vatNumber: cleanString(providerRaw.vatNumber, 40),
-                address: cleanString(providerRaw.address, 500),
-                postalCity: cleanString(providerRaw.postalCity, 200),
-                country: cleanString(providerRaw.country || 'Italia', 100),
-                email: cleanString(providerRaw.email, 254),
-                phone: cleanString(providerRaw.phone, 80),
-                website: cleanString(providerRaw.website || 'https://www.creatorweb.cc/', 300)
-            };
-            const legalRaw = suppliedDocument.legal && typeof suppliedDocument.legal === 'object'
-                ? suppliedDocument.legal
-                : {};
-            const safeLegalUrl = (value, fallback) => {
-                const url = cleanString(value || fallback, 500);
-                return /^https:\/\/[^\s]+$/i.test(url) ? url : fallback;
-            };
-            const legal = {
-                termsUrl: safeLegalUrl(legalRaw.termsUrl, 'https://www.creatorweb.cc/termini.html'),
-                privacyUrl: safeLegalUrl(legalRaw.privacyUrl, 'https://www.creatorweb.cc/privacy.html'),
-                taxStatement: cleanString(legalRaw.taxStatement, 1000)
-            };
-            const subscriptionPrices = { Base: 1000, Standard: 2000, Premium: 5000 };
-            const recurringPlan = cleanString(fields.recurringPlan, 30);
-            const recurringPriceCents = Object.prototype.hasOwnProperty.call(subscriptionPrices, recurringPlan)
-                ? subscriptionPrices[recurringPlan] : null;
-
-            const id = crypto.randomBytes(32).toString('hex');
-            const year = now.getFullYear();
-            const quoteNumber = `CW-${year}-${id.slice(0, 8).toUpperCase()}`;
-            fields.quoteNumber = quoteNumber;
-            const termsVersion = process.env.TERMS_VERSION || '2026-11-12';
-            const siteUrl = (process.env.PUBLIC_SITE_URL || 'https://www.creatorweb.cc').replace(/\/+$/, '');
-            const publicUrl = `${siteUrl}/accettazione/${id}`;
-
-            const documentSnapshot = {
-                fields,
-                items,
-                itemPricing,
-                provider,
-                legal,
-                recurringPriceCents
-            };
-            const snapshot = {
-                quoteNumber,
-                client: { name: clientName, email: clientEmail, type: clientType, address: clientAddress },
-                project: { title: projectTitle, description, included, excluded, timeline },
-                items,
-                totalCents,
-                document: documentSnapshot,
-                terms: { paymentTerms, revisions, notes, validDays },
-                termsVersion,
-                termsUrl: legal.termsUrl
-            };
-            const quoteHash = crypto.createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
-            const quoteRef = db.collection('preventivi_emessi').doc(id);
-            const record = {
-                id,
-                quoteNumber,
-                client: snapshot.client,
-                project: snapshot.project,
-                items,
-                totalCents,
-                currency: 'EUR',
-                document: documentSnapshot,
-                terms: snapshot.terms,
-                termsVersion,
-                termsUrl: legal.termsUrl,
-                quoteHash,
-                publicUrl,
-                status: 'pending',
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                createdAtIso: now.toISOString(),
-                validUntil: admin.firestore.Timestamp.fromDate(validUntil),
-                validUntilIso: validUntil.toISOString(),
-                createdBy: adminUser.uid
-            };
-
-            await quoteRef.create(record);
-            return sendJson(res, 201, {
-                success: true,
-                id,
-                quoteNumber,
-                publicUrl,
-                totalCents,
-                validUntil: validUntil.toISOString(),
-                status: 'pending'
-            });
+            return await handleCreateQuote(req, res, adminUser);
         }
+
         if (action === 'create_communication') {
             const title = cleanString(body.title, 150);
             const message = cleanString(body.message, 5000);
             const links = normalizeCommunicationLinks(body.links);
             const targetType = cleanString(body.targetType, 20);
             const targetUid = cleanString(body.targetUid, 150);
-        
+
             if (!title || !message) {
-                return sendJson(res, 400, {
-                    error: 'Inserisci un titolo e un messaggio.'
-                });
+                return sendJson(res, 400, { error: 'Inserisci un titolo e un messaggio.' });
             }
-        
             if (!['all', 'user'].includes(targetType)) {
-                return sendJson(res, 400, {
-                    error: 'Destinatario non valido.'
-                });
+                return sendJson(res, 400, { error: 'Destinatario non valido.' });
             }
-        
+
             let recipientUid = null;
-        
             if (targetType === 'user') {
-                if (!validDocumentId(targetUid)) {
-                    return sendJson(res, 400, {
-                        error: 'Seleziona un cliente valido.'
-                    });
-                }
-        
-                const userSnapshot = await db
-                    .collection('utenti_dashboard')
-                    .doc(targetUid)
-                    .get();
-        
-                if (!userSnapshot.exists) {
-                    return sendJson(res, 404, {
-                        error: 'Cliente non trovato.'
-                    });
-                }
-        
+                await getUserProfileOrThrow(targetUid);
                 recipientUid = targetUid;
             }
-        
+
             const communicationRef = db.collection('comunicazioni').doc();
-        
             await communicationRef.create({
                 title,
                 message,
@@ -595,13 +732,10 @@ module.exports = async function handler(req, res) {
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 createdBy: adminUser.uid
             });
-        
-            return sendJson(res, 201, {
-                success: true,
-                id: communicationRef.id
-            });
+
+            return sendJson(res, 201, { success: true, id: communicationRef.id });
         }
-        
+
         if (action === 'update_communication') {
             const communicationId = cleanString(body.communicationId, 150);
             const title = cleanString(body.title, 150);
@@ -611,56 +745,25 @@ module.exports = async function handler(req, res) {
             const links = normalizeCommunicationLinks(body.links);
 
             if (!validDocumentId(communicationId)) {
-                return sendJson(res, 400, {
-                    error: 'ID comunicazione non valido.'
-                });
+                return sendJson(res, 400, { error: 'ID comunicazione non valido.' });
             }
-
             if (!title || !message) {
-                return sendJson(res, 400, {
-                    error: 'Inserisci un titolo e un messaggio.'
-                });
+                return sendJson(res, 400, { error: 'Inserisci un titolo e un messaggio.' });
             }
-
             if (!['all', 'user'].includes(targetType)) {
-                return sendJson(res, 400, {
-                    error: 'Destinatario non valido.'
-                });
+                return sendJson(res, 400, { error: 'Destinatario non valido.' });
             }
 
             let recipientUid = null;
-
             if (targetType === 'user') {
-                if (!validDocumentId(targetUid)) {
-                    return sendJson(res, 400, {
-                        error: 'Seleziona un cliente valido.'
-                    });
-                }
-
-                const userSnapshot = await db
-                    .collection('utenti_dashboard')
-                    .doc(targetUid)
-                    .get();
-
-                if (!userSnapshot.exists) {
-                    return sendJson(res, 404, {
-                        error: 'Cliente non trovato.'
-                    });
-                }
-
+                await getUserProfileOrThrow(targetUid);
                 recipientUid = targetUid;
             }
 
-            const communicationRef = db
-                .collection('comunicazioni')
-                .doc(communicationId);
-
+            const communicationRef = db.collection('comunicazioni').doc(communicationId);
             const existing = await communicationRef.get();
-
             if (!existing.exists) {
-                return sendJson(res, 404, {
-                    error: 'Comunicazione non trovata.'
-                });
+                return sendJson(res, 404, { error: 'Comunicazione non trovata.' });
             }
 
             await communicationRef.update({
@@ -669,47 +772,31 @@ module.exports = async function handler(req, res) {
                 targetType,
                 targetUid: recipientUid,
                 links,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedBy: adminUser.uid
             });
 
-            return sendJson(res, 200, {
-                success: true,
-                id: communicationId
-            });
+            return sendJson(res, 200, { success: true, id: communicationId });
         }
-
 
         if (action === 'delete_communication') {
             const communicationId = cleanString(body.communicationId, 150);
-
             if (!validDocumentId(communicationId)) {
-                return sendJson(res, 400, {
-                    error: 'ID comunicazione non valido.'
-                });
+                return sendJson(res, 400, { error: 'ID comunicazione non valido.' });
             }
 
-            const communicationRef = db
-                .collection('comunicazioni')
-                .doc(communicationId);
-
+            const communicationRef = db.collection('comunicazioni').doc(communicationId);
             const existing = await communicationRef.get();
-
             if (!existing.exists) {
-                return sendJson(res, 404, {
-                    error: 'Comunicazione non trovata.'
-                });
+                return sendJson(res, 404, { error: 'Comunicazione non trovata.' });
             }
 
             await communicationRef.delete();
-
-            return sendJson(res, 200, {
-                success: true
-            });
+            return sendJson(res, 200, { success: true });
         }
 
         if (action === 'get_collection') {
             const collectionName = cleanString(body.collection, 100);
-
             if (!ALLOWED_COLLECTIONS.has(collectionName)) {
                 return sendJson(res, 403, { error: 'Collezione non autorizzata' });
             }
@@ -721,9 +808,14 @@ module.exports = async function handler(req, res) {
             }));
 
             docs.sort((a, b) => {
-                const dateA = a.data.data || a.data.createdAt || a.data.ultimo_aggiornamento || '';
-                const dateB = b.data.data || b.data.createdAt || b.data.ultimo_aggiornamento || '';
-                return String(dateB).localeCompare(String(dateA));
+                const rawA = a.data.data || a.data.createdAt || a.data.ultimo_aggiornamento || '';
+                const rawB = b.data.data || b.data.createdAt || b.data.ultimo_aggiornamento || '';
+                const timeA = Date.parse(String(rawA));
+                const timeB = Date.parse(String(rawB));
+                if (Number.isFinite(timeA) && Number.isFinite(timeB)) {
+                    return timeB - timeA;
+                }
+                return String(rawB).localeCompare(String(rawA));
             });
 
             return sendJson(res, 200, { data: docs });
@@ -737,52 +829,33 @@ module.exports = async function handler(req, res) {
         }
 
         if (action === 'update_form_block') {
-        
             const enabled = body.enabled;
-
             if (typeof enabled !== 'boolean') {
-                return sendJson(res, 400, {
-                    error: 'Valore del blocco non valido.'
-                });
+                return sendJson(res, 400, { error: 'Valore del blocco non valido.' });
             }
 
-            await db
-                .collection('stato del servizio')
-                .doc('current_status')
-                .set({
-                
-                    limite_clienti_attivo: enabled,
+            await db.collection('stato del servizio').doc('current_status').set({
+                limite_clienti_attivo: enabled,
+                limite_clienti_aggiornato_il: admin.firestore.FieldValue.serverTimestamp(),
+                limite_clienti_aggiornato_da: adminUser.uid
+            }, { merge: true });
 
-                    limite_clienti_aggiornato_il:
-                        admin.firestore.FieldValue.serverTimestamp()
-
-                }, {
-                    merge: true
-                });
-
-            return sendJson(res, 200, {
-                success: true,
-                enabled
-            });
-
+            return sendJson(res, 200, { success: true, enabled });
         }
 
         if (action === 'configure_project_payment') {
             const userId = body.userId;
-            if (!validDocumentId(userId)) {
-                return sendJson(res, 400, { error: 'ID utente non valido.' });
-            }
-
-            const profileRef = db.collection('utenti_dashboard').doc(userId);
-            const profileSnapshot = await profileRef.get();
-            if (!profileSnapshot.exists) {
-                return sendJson(res, 404, { error: 'Profilo cliente non trovato.' });
-            }
+            const { ref: profileRef, data: profile } = await getUserProfileOrThrow(userId);
 
             const totalEur = Number(body.totalEur);
-            if (!Number.isFinite(totalEur) || totalEur <= 0 || Math.round(totalEur * 100) <= 0 || Math.abs(totalEur * 100 - Math.round(totalEur * 100)) > 0.00001) {
+            if (
+                !Number.isFinite(totalEur)
+                || totalEur <= 0
+                || Math.abs(totalEur * 100 - Math.round(totalEur * 100)) > 1e-5
+            ) {
                 return sendJson(res, 400, { error: 'Inserisci un totale progetto valido, in euro e con massimo due decimali.' });
             }
+
             const totalCents = Math.round(totalEur * 100);
             if (!Number.isSafeInteger(totalCents)) {
                 return sendJson(res, 400, { error: 'Importo progetto troppo elevato.' });
@@ -796,32 +869,30 @@ module.exports = async function handler(req, res) {
                 return sendJson(res, 400, { error: 'Seleziona il piano Base, Standard o Premium.' });
             }
 
-            const profile = profileSnapshot.data() || {};
-            try {
-                const authUser = await admin.auth().getUser(userId);
-                if (authUser.disabled) return sendJson(res, 409, { error: 'L’account Firebase del cliente è disabilitato.' });
-            } catch (error) {
-                if (error.code === 'auth/user-not-found') return sendJson(res, 409, { error: 'Prima migra questo profilo collegandolo a un account Firebase Authentication.' });
-                throw error;
-            }
+            await assertActiveAuthUser(userId);
+
             const payments = profile.pagamenti || {};
             const currentProject = payments.progetto || {};
             const currentPhase = Number(currentProject.fase || 0);
             const currentTotal = Number(currentProject.totale_cent || 0);
             const oldRates = currentProject.rate || {};
+
             const anyPaid = ['rata_1', 'rata_2', 'rata_3'].some(key => oldRates[key]?.stato === 'paid');
             const checkoutStarted = ['rata_1', 'rata_2', 'rata_3'].some(key => oldRates[key]?.stato === 'checkout_pending');
 
             if (currentTotal > 0 && currentTotal !== totalCents && (currentPhase > 0 || anyPaid || checkoutStarted)) {
-                return sendJson(res, 409, { error: 'Il totale non può essere modificato dopo l’avvio delle fasi o l’apertura di un pagamento. Contatta il supporto per una correzione controllata.' });
+                return sendJson(res, 409, {
+                    error: 'Il totale non può essere modificato dopo l’avvio delle fasi o l’apertura di un pagamento. Contatta il supporto per una correzione controllata.'
+                });
             }
 
             const firstCents = Math.round(totalCents * 0.20);
             const secondCents = Math.round(totalCents * 0.60);
             const thirdCents = totalCents - firstCents - secondCents;
             const amounts = [firstCents, secondCents, thirdCents];
+
             const rates = {};
-            for (let index = 1; index <= 3; index++) {
+            for (let index = 1; index <= 3; index += 1) {
                 const key = `rata_${index}`;
                 const oldRate = oldRates[key] || {};
                 rates[key] = {
@@ -841,12 +912,15 @@ module.exports = async function handler(req, res) {
                 ['active', 'trialing', 'past_due', 'unpaid', 'incomplete', 'checkout_pending', 'in_attivazione'].includes(subscriptionStatus)
                 && oldSubscription.piano_scelto !== requestedPlan
             )) {
-                return sendJson(res, 409, { error: 'Il piano non può essere modificato mentre esiste un abbonamento in corso. Il cliente potrà cambiarlo dal portale Stripe.' });
+                return sendJson(res, 409, {
+                    error: 'Il piano non può essere modificato mentre esiste un abbonamento in corso. Il cliente potrà cambiarlo dal portale Stripe.'
+                });
             }
 
-            const paidCents = ['rata_1', 'rata_2', 'rata_3'].reduce((sum, key) => {
-                return sum + (rates[key]?.stato === 'paid' ? Number(rates[key].importo_cent || 0) : 0);
-            }, 0);
+            const paidCents = ['rata_1', 'rata_2', 'rata_3'].reduce((sum, key) => (
+                sum + (rates[key]?.stato === 'paid' ? Number(rates[key].importo_cent || 0) : 0)
+            ), 0);
+
             const project = {
                 ...currentProject,
                 fase: currentPhase,
@@ -857,6 +931,7 @@ module.exports = async function handler(req, res) {
                 rate: rates,
                 ultimo_aggiornamento: admin.firestore.FieldValue.serverTimestamp()
             };
+
             const subscription = {
                 ...oldSubscription,
                 piano_scelto: requestedPlan,
@@ -881,6 +956,7 @@ module.exports = async function handler(req, res) {
         if (action === 'advance_project_phase') {
             const userId = body.userId;
             const targetPhase = Number(body.phase);
+
             if (!validDocumentId(userId)) {
                 return sendJson(res, 400, { error: 'ID utente non valido.' });
             }
@@ -888,72 +964,65 @@ module.exports = async function handler(req, res) {
                 return sendJson(res, 400, { error: 'Fase progetto non valida.' });
             }
 
+            await assertActiveAuthUser(userId);
             const profileRef = db.collection('utenti_dashboard').doc(userId);
-            const snapshot = await profileRef.get();
-            if (!snapshot.exists) return sendJson(res, 404, { error: 'Profilo cliente non trovato.' });
-            const profile = snapshot.data() || {};
-            try {
-                const authUser = await admin.auth().getUser(userId);
-                if (authUser.disabled) return sendJson(res, 409, { error: 'L’account Firebase del cliente è disabilitato.' });
-            } catch (error) {
-                if (error.code === 'auth/user-not-found') return sendJson(res, 409, { error: 'Prima migra questo profilo collegandolo a un account Firebase Authentication.' });
-                throw error;
-            }
-            const payments = profile.pagamenti || {};
-            const project = payments.progetto || {};
-            const currentPhase = Number(project.fase || 0);
-            if (Number(project.totale_cent || 0) <= 0) {
-                return sendJson(res, 409, { error: 'Prima configura il totale del progetto.' });
-            }
-            if (targetPhase !== currentPhase + 1) {
-                return sendJson(res, 409, { error: `Puoi attivare soltanto la fase ${currentPhase + 1}.` });
-            }
-            if (targetPhase > 1 && project.rate?.[`rata_${targetPhase - 1}`]?.stato !== 'paid') {
-                return sendJson(res, 409, { error: `Per attivare la fase ${targetPhase} deve prima risultare pagata la rata ${targetPhase - 1}.` });
-            }
 
-            const rateKey = `rata_${targetPhase}`;
-            await profileRef.update({
-                'pagamenti.progetto.fase': targetPhase,
-                [`pagamenti.progetto.rate.${rateKey}.stato`]: 'unlocked',
-                [`pagamenti.progetto.rate.${rateKey}.sbloccata_il`]: admin.firestore.FieldValue.serverTimestamp(),
-                'pagamenti.progetto.ultimo_aggiornamento': admin.firestore.FieldValue.serverTimestamp(),
-                'pagamenti_aggiornati_il': admin.firestore.FieldValue.serverTimestamp()
+            await db.runTransaction(async (tx) => {
+                const snapshot = await tx.get(profileRef);
+                if (!snapshot.exists) {
+                    throw httpError(404, 'Profilo cliente non trovato.');
+                }
+
+                const profile = snapshot.data() || {};
+                const project = profile.pagamenti?.progetto || {};
+                const currentPhase = Number(project.fase || 0);
+
+                if (Number(project.totale_cent || 0) <= 0) {
+                    throw httpError(409, 'Prima configura il totale del progetto.');
+                }
+                if (targetPhase !== currentPhase + 1) {
+                    throw httpError(409, `Puoi attivare soltanto la fase ${currentPhase + 1}.`);
+                }
+                if (targetPhase > 1 && project.rate?.[`rata_${targetPhase - 1}`]?.stato !== 'paid') {
+                    throw httpError(409, `Per attivare la fase ${targetPhase} deve prima risultare pagata la rata ${targetPhase - 1}.`);
+                }
+
+                const rateKey = `rata_${targetPhase}`;
+                tx.update(profileRef, {
+                    'pagamenti.progetto.fase': targetPhase,
+                    [`pagamenti.progetto.rate.${rateKey}.stato`]: 'unlocked',
+                    [`pagamenti.progetto.rate.${rateKey}.sbloccata_il`]: admin.firestore.FieldValue.serverTimestamp(),
+                    'pagamenti.progetto.ultimo_aggiornamento': admin.firestore.FieldValue.serverTimestamp(),
+                    pagamenti_aggiornati_il: admin.firestore.FieldValue.serverTimestamp()
+                });
             });
+
             return sendJson(res, 200, { success: true, phase: targetPhase, unlocked_installment: targetPhase });
         }
 
         if (action === 'enable_subscription_activation') {
             const userId = body.userId;
-            if (!validDocumentId(userId)) {
-                return sendJson(res, 400, { error: 'ID utente non valido.' });
-            }
-            const profileRef = db.collection('utenti_dashboard').doc(userId);
-            const snapshot = await profileRef.get();
-            if (!snapshot.exists) return sendJson(res, 404, { error: 'Profilo cliente non trovato.' });
-            const profile = snapshot.data() || {};
-            try {
-                const authUser = await admin.auth().getUser(userId);
-                if (authUser.disabled) return sendJson(res, 409, { error: 'L’account Firebase del cliente è disabilitato.' });
-            } catch (error) {
-                if (error.code === 'auth/user-not-found') return sendJson(res, 409, { error: 'Prima migra questo profilo collegandolo a un account Firebase Authentication.' });
-                throw error;
-            }
+            const { ref: profileRef, data: profile } = await getUserProfileOrThrow(userId);
+            await assertActiveAuthUser(userId);
+
             const payments = profile.pagamenti || {};
             const project = payments.progetto || {};
             const subscription = payments.abbonamento || {};
+
             if (Number(project.fase || 0) !== 3 || project.rate?.rata_3?.stato !== 'paid') {
                 return sendJson(res, 409, { error: 'Puoi abilitare l’abbonamento solo dopo la fase 3 e il pagamento della rata finale.' });
             }
             if (!['base', 'standard', 'premium'].includes(String(subscription.piano_scelto || '').toLowerCase())) {
                 return sendJson(res, 409, { error: 'Prima seleziona il piano mensile del cliente.' });
             }
+
             await profileRef.update({
                 'pagamenti.abbonamento.attivazione_abilitata': true,
                 'pagamenti.abbonamento.stato': 'in_attesa_conferma_cliente',
                 'pagamenti.abbonamento.attivazione_abilitata_il': admin.firestore.FieldValue.serverTimestamp(),
-                'pagamenti_aggiornati_il': admin.firestore.FieldValue.serverTimestamp()
+                pagamenti_aggiornati_il: admin.firestore.FieldValue.serverTimestamp()
             });
+
             return sendJson(res, 200, { success: true, activation_enabled: true });
         }
 
@@ -977,8 +1046,9 @@ module.exports = async function handler(req, res) {
                 }
                 throw error;
             }
-            if (authUser.disabled || !authUser.email) {
-                return sendJson(res, 400, { error: 'L’account Firebase deve essere attivo e avere un indirizzo email.' });
+
+            if (authUser.disabled || !isValidEmail(authUser.email)) {
+                return sendJson(res, 400, { error: 'L’account Firebase deve essere attivo e avere un indirizzo email valido.' });
             }
 
             const email = authUser.email.trim().toLowerCase();
@@ -996,35 +1066,18 @@ module.exports = async function handler(req, res) {
             const recoveryCodes = Array.isArray(body.recoveryCodes)
                 ? body.recoveryCodes.map(code => cleanString(code, 30).replace(/[\s-]/g, '').toUpperCase())
                 : [];
+
             if (
-                recoveryCodes.length !== 8 ||
-                new Set(recoveryCodes).size !== 8 ||
-                recoveryCodes.some(code => !/^[A-F0-9]{12}$/.test(code))
+                recoveryCodes.length !== 8
+                || new Set(recoveryCodes).size !== 8
+                || recoveryCodes.some(code => !/^[A-F0-9]{12}$/.test(code))
             ) {
                 return sendJson(res, 400, { error: 'Devi generare esattamente 8 codici di sicurezza validi e distinti.' });
             }
 
             const userRef = db.collection('utenti_dashboard').doc(uid);
-            const existingUidDoc = await userRef.get();
-            if (existingUidDoc.exists) {
-                return sendJson(res, 409, { error: 'Esiste già un profilo CreatorWeb associato a questo UID.' });
-            }
-
-            let legacySnapshot = null;
-            if (legacyUserId) {
-                legacySnapshot = await db.collection('utenti_dashboard').doc(legacyUserId).get();
-                if (!legacySnapshot.exists) {
-                    return sendJson(res, 404, { error: 'Il vecchio documento indicato non esiste in utenti_dashboard.' });
-                }
-                const legacyRecord = legacySnapshot.data() || {};
-                if (legacyRecord.migrated_to_uid && legacyRecord.migrated_to_uid !== uid) {
-                    return sendJson(res, 409, { error: `Questo vecchio documento risulta già migrato sull’UID ${legacyRecord.migrated_to_uid}.` });
-                }
-                const legacyEmail = cleanString(legacyRecord.email, 254).toLowerCase();
-                if (legacyEmail && legacyEmail !== email) {
-                    return sendJson(res, 409, { error: 'L’email del vecchio documento non coincide con quella dell’account Firebase.' });
-                }
-            }
+            const legacyRef = legacyUserId ? db.collection('utenti_dashboard').doc(legacyUserId) : null;
+            const legacyPrivateRef = legacyUserId ? db.collection('users').doc(legacyUserId) : null;
 
             const emailMatches = await db.collection('utenti_dashboard').where('email', '==', email).get();
             const duplicateEmail = emailMatches.docs.find(doc => doc.id !== legacyUserId && doc.id !== uid);
@@ -1032,50 +1085,79 @@ module.exports = async function handler(req, res) {
                 return sendJson(res, 409, { error: 'Questa email è presente in un altro profilo. Indica il relativo ID come vecchio documento da migrare.' });
             }
 
-            if (legacySnapshot?.exists) {
-                const legacyData = pickUserFields(legacySnapshot.data(), true);
-                const requestedName = userData.nome;
-                const requestedUsername = userData.nome_utente;
-                Object.assign(userData, legacyData);
-                userData.nome = requestedName || userData.nome;
-                userData.nome_utente = requestedUsername || userData.nome_utente;
-                userData.email = email;
+            const candidateUsername = cleanString(userData.nome_utente, 2000).toLowerCase();
+            if (candidateUsername) {
+                const usernameMatches = await db.collection('utenti_dashboard')
+                    .where('nome_utente', '==', candidateUsername)
+                    .get();
+                const duplicateUsername = usernameMatches.docs.find(doc => doc.id !== legacyUserId && doc.id !== uid);
+                if (duplicateUsername) {
+                    return sendJson(res, 409, { error: 'Questo nome utente è già utilizzato.' });
+                }
             }
 
-            if (!userData.nome_utente) {
-                return sendJson(res, 400, { error: 'Il nome utente è obbligatorio.' });
-            }
-            userData.nome_utente = userData.nome_utente.toLowerCase();
-            userData.nome = userData.nome || userData.nome_utente;
-            userData.codici_sicurezza_hash = recoveryCodes.map(code =>
-                crypto.createHash('sha256').update(code).digest('hex')
-            );
-            userData.codici_sicurezza_generati_il = admin.firestore.FieldValue.serverTimestamp();
-            userData.data = admin.firestore.FieldValue.serverTimestamp();
-            userData.account = {
-                must_change_password: true,
-                created_at: admin.firestore.FieldValue.serverTimestamp()
-            };
-            userData.migrated_from_legacy_id = legacyUserId || null;
-
-            const usernameMatches = await db.collection('utenti_dashboard')
-                .where('nome_utente', '==', userData.nome_utente)
-                .get();
-            const duplicateUsername = usernameMatches.docs.find(doc => doc.id !== legacyUserId && doc.id !== uid);
-            if (duplicateUsername) {
-                return sendJson(res, 409, { error: 'Questo nome utente è già utilizzato.' });
-            }
-
-            const batch = db.batch();
-            batch.create(userRef, userData);
-
+            let legacyExists = false;
             let privateDataCopied = false;
-            if (legacyUserId) {
-                const legacyPrivateRef = db.collection('users').doc(legacyUserId);
-                const legacyPrivateSnapshot = await legacyPrivateRef.get();
-                if (legacyPrivateSnapshot.exists) {
+
+            await db.runTransaction(async (tx) => {
+                const existingUidDoc = await tx.get(userRef);
+                if (existingUidDoc.exists) {
+                    throw httpError(409, 'Esiste già un profilo CreatorWeb associato a questo UID.');
+                }
+
+                let legacySnapshot = null;
+                if (legacyRef) {
+                    legacySnapshot = await tx.get(legacyRef);
+                    if (!legacySnapshot.exists) {
+                        throw httpError(404, 'Il vecchio documento indicato non esiste in utenti_dashboard.');
+                    }
+                    legacyExists = true;
+
+                    const legacyRecord = legacySnapshot.data() || {};
+                    if (legacyRecord.migrated_to_uid && legacyRecord.migrated_to_uid !== uid) {
+                        throw httpError(409, `Questo vecchio documento risulta già migrato sull’UID ${legacyRecord.migrated_to_uid}.`);
+                    }
+
+                    const legacyEmail = cleanString(legacyRecord.email, 254).toLowerCase();
+                    if (legacyEmail && legacyEmail !== email) {
+                        throw httpError(409, 'L’email del vecchio documento non coincide con quella dell’account Firebase.');
+                    }
+                }
+
+                const legacyPrivateSnapshot = legacyPrivateRef ? await tx.get(legacyPrivateRef) : null;
+
+                if (legacySnapshot?.exists) {
+                    const legacyData = pickUserFields(legacySnapshot.data(), true);
+                    const requestedName = userData.nome;
+                    const requestedUsername = userData.nome_utente;
+                    Object.assign(userData, legacyData);
+                    userData.nome = requestedName || userData.nome;
+                    userData.nome_utente = requestedUsername || userData.nome_utente;
+                    userData.email = email;
+                }
+
+                if (!userData.nome_utente) {
+                    throw httpError(400, 'Il nome utente è obbligatorio.');
+                }
+
+                userData.nome_utente = userData.nome_utente.toLowerCase();
+                userData.nome = userData.nome || userData.nome_utente;
+                userData.codici_sicurezza_hash = recoveryCodes.map(code => (
+                    crypto.createHash('sha256').update(code).digest('hex')
+                ));
+                userData.codici_sicurezza_generati_il = admin.firestore.FieldValue.serverTimestamp();
+                userData.data = admin.firestore.FieldValue.serverTimestamp();
+                userData.account = {
+                    must_change_password: true,
+                    created_at: admin.firestore.FieldValue.serverTimestamp()
+                };
+                userData.migrated_from_legacy_id = legacyUserId || null;
+
+                tx.create(userRef, userData);
+
+                if (legacyRef && legacyPrivateSnapshot?.exists) {
                     const privateData = legacyPrivateSnapshot.data() || {};
-                    batch.set(db.collection('users').doc(uid), {
+                    tx.set(db.collection('users').doc(uid), {
                         ...privateData,
                         userid: uid,
                         migrated_from_legacy_id: legacyUserId,
@@ -1083,32 +1165,34 @@ module.exports = async function handler(req, res) {
                     }, { merge: true });
                     privateDataCopied = true;
                 }
-                batch.set(db.collection('utenti_dashboard').doc(legacyUserId), {
-                    password: admin.firestore.FieldValue.delete(),
-                    codici_sicurezza_hash: admin.firestore.FieldValue.delete(),
-                    migrated_to_uid: uid,
-                    migrated_at: admin.firestore.FieldValue.serverTimestamp()
-                }, { merge: true });
-            }
 
-            await batch.commit();
+                if (legacyRef) {
+                    tx.set(legacyRef, {
+                        password: admin.firestore.FieldValue.delete(),
+                        codici_sicurezza_hash: admin.firestore.FieldValue.delete(),
+                        migrated_to_uid: uid,
+                        migrated_at: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+                }
+            });
+
             const stripeMappingCounts = {};
             const stripeMappingWarnings = [];
             let stripeEventCount = 0;
+
             if (legacyUserId) {
-                for (const collectionName of ['stripeCustomers', 'stripeSubscriptions', 'stripeAccounts']) {
+                for (const stripeCol of ['stripeCustomers', 'stripeSubscriptions', 'stripeAccounts']) {
                     try {
-                        const mappings = await db.collection(collectionName).where('userid', '==', legacyUserId).get();
-                        stripeMappingCounts[collectionName] = mappings.size;
+                        const mappings = await db.collection(stripeCol).where('userid', '==', legacyUserId).get();
+                        stripeMappingCounts[stripeCol] = mappings.size;
                         const writer = db.bulkWriter();
                         mappings.docs.forEach(mapping => writer.set(mapping.ref, {
                             userid: uid,
                             migrated_from_legacy_id: legacyUserId
                         }, { merge: true }));
                         await writer.close();
-                    } catch (error) {
-                        console.error(`Migrazione mapping ${collectionName} non riuscita:`, error);
-                        stripeMappingWarnings.push(collectionName);
+                    } catch {
+                        stripeMappingWarnings.push(stripeCol);
                     }
                 }
 
@@ -1123,8 +1207,7 @@ module.exports = async function handler(req, res) {
                         { merge: true }
                     ));
                     await writer.close();
-                } catch (error) {
-                    console.error('Migrazione storico eventi Stripe non riuscita:', error);
+                } catch {
                     stripeMappingWarnings.push('users/{legacyId}/stripeEvents');
                 }
             }
@@ -1134,7 +1217,7 @@ module.exports = async function handler(req, res) {
                 uid,
                 email,
                 recovery_codes_saved: 8,
-                migrated_legacy_profile: Boolean(legacySnapshot?.exists),
+                migrated_legacy_profile: legacyExists,
                 migrated_private_data: privateDataCopied,
                 migrated_stripe_mappings: stripeMappingCounts,
                 migrated_stripe_events: stripeEventCount,
@@ -1144,21 +1227,11 @@ module.exports = async function handler(req, res) {
 
         if (action === 'update_user') {
             const collectionName = cleanString(body.collection || 'utenti_dashboard', 100);
-            const userId = body.userId;
-
             if (collectionName !== 'utenti_dashboard') {
                 return sendJson(res, 403, { error: 'Collezione non autorizzata' });
             }
-            if (!validDocumentId(userId)) {
-                return sendJson(res, 400, { error: 'ID utente non valido' });
-            }
 
-            const userRef = db.collection('utenti_dashboard').doc(userId);
-            const existingProfile = await userRef.get();
-            if (!existingProfile.exists) {
-                return sendJson(res, 404, { error: 'Profilo utente non trovato' });
-            }
-
+            const { ref: userRef } = await getUserProfileOrThrow(body.userId);
             const cleanData = pickUserFields(body.data, false);
             if (Object.keys(cleanData).length === 0) {
                 return sendJson(res, 400, { error: 'Nessun campo utente valido da aggiornare' });
@@ -1167,8 +1240,8 @@ module.exports = async function handler(req, res) {
             if (typeof cleanData.email === 'string' && cleanData.email) {
                 cleanData.email = cleanData.email.toLowerCase();
                 try {
-                    await admin.auth().getUser(userId);
-                    await admin.auth().updateUser(userId, { email: cleanData.email });
+                    await admin.auth().getUser(body.userId);
+                    await admin.auth().updateUser(body.userId, { email: cleanData.email });
                 } catch (error) {
                     if (error.code !== 'auth/user-not-found') throw error;
                 }
@@ -1187,25 +1260,15 @@ module.exports = async function handler(req, res) {
                 return sendJson(res, 400, { error: 'ID utente non valido' });
             }
 
-            const apiToken = cleanString(
-                data.api_token || data.apitoken_cf || '',
-                1000
-            );
+            const apiToken = cleanString(data.api_token || data.apitoken_cf || '', 1000);
+            const accountId = cleanString(data.account_id || data.accid_cf || '', 200);
+            const zoneId = cleanString(data.zone_id || '', 200);
 
-            const accountId = cleanString(
-                data.account_id || data.accid_cf || '',
-                200
-            );
-
-            const zoneId = cleanString(
-                data.zone_id || '',
-                200
-            );
             const hasChanges = Boolean(
-                apiToken || accountId || zoneId ||
-                data.clear_apitoken_cf === true ||
-                data.clear_accid_cf === true ||
-                data.clear_zone_id === true
+                apiToken || accountId || zoneId
+                || data.clear_apitoken_cf === true
+                || data.clear_accid_cf === true
+                || data.clear_zone_id === true
             );
 
             if (!hasChanges) {
@@ -1231,25 +1294,17 @@ module.exports = async function handler(req, res) {
             else if (zoneId) cloudflare.zone_id = zoneId;
 
             await userRef.set({ cloudflare }, { merge: true });
+
             const savedSnapshot = await userRef.get();
-            
-            const savedCloudflare = savedSnapshot.exists
-                ? savedSnapshot.data().cloudflare || {}
-                : {};
-            
-            const missingFields = [
-                'api_token',
-                'account_id',
-                'zone_id'
-            ].filter(field => !savedCloudflare[field]);
-            
+            const savedCloudflare = savedSnapshot.exists ? (savedSnapshot.data().cloudflare || {}) : {};
+            const missingFields = ['api_token', 'account_id', 'zone_id']
+                .filter(field => !savedCloudflare[field]);
+
             return sendJson(res, 200, {
                 success: true,
                 config_complete: missingFields.length === 0,
                 missing_fields: missingFields
             });
-            
-            return sendJson(res, 200, { success: true });
         }
 
         if (action === 'delete_support_request') {
@@ -1277,7 +1332,8 @@ module.exports = async function handler(req, res) {
             const updatePayload = {
                 stato,
                 status: stato,
-                ultimo_aggiornamento: admin.firestore.FieldValue.serverTimestamp()
+                ultimo_aggiornamento: admin.firestore.FieldValue.serverTimestamp(),
+                aggiornato_da: adminUser.uid
             };
 
             if (body.messaggio !== undefined) {
@@ -1295,10 +1351,123 @@ module.exports = async function handler(req, res) {
             return sendJson(res, 200, { success: true });
         }
 
-        return sendJson(res, 400, { error: 'Azione non riconosciuta' });
+        if (action === 'send_resend_email') {
+            const recipientMode = cleanString(body.recipientMode, 20);
+            const recipientUid = cleanString(body.recipientUid, 150);
+            const templateKey = cleanString(body.templateKey, 50) || 'personalizzato';
+            const subject = cleanString(body.subject, 200);
+            const standardText = cleanString(body.standardText, 5000);
+            const extraText = cleanString(body.extraText, 5000);
+            const rawHtml = cleanString(body.html, 100_000);
+            const attachment = body.attachment && typeof body.attachment === 'object'
+                ? body.attachment
+                : null;
 
+            if (!['single', 'all'].includes(recipientMode)) {
+                return sendJson(res, 400, { error: 'Modalità destinatari non valida.' });
+            }
+            if (!subject) {
+                return sendJson(res, 400, { error: 'L’oggetto dell’email è obbligatorio.' });
+            }
+
+            const composedHtml = buildFallbackEmailHtml({ standardText, extraText, rawHtml });
+            if (!composedHtml) {
+                return sendJson(res, 400, { error: 'Il contenuto dell’email è vuoto.' });
+            }
+
+            let targetEmails = [];
+            let targetSummary = '';
+
+            if (recipientMode === 'single') {
+                const { data: userData } = await getUserProfileOrThrow(recipientUid);
+                const userEmail = cleanString(userData.email, 254).toLowerCase();
+                if (!isValidEmail(userEmail)) {
+                    return sendJson(res, 400, { error: 'L’utente selezionato non ha un indirizzo email valido.' });
+                }
+                targetEmails = [userEmail];
+                targetSummary = `single:${recipientUid}`;
+            } else {
+                const usersSnap = await db.collection('utenti_dashboard').get();
+                const emailSet = new Set();
+                usersSnap.docs.forEach(doc => {
+                    const data = doc.data() || {};
+                    if (data.migrated_to_uid) return;
+                    const addr = cleanString(data.email, 254).toLowerCase();
+                    if (isValidEmail(addr)) {
+                        emailSet.add(addr);
+                    }
+                });
+                targetEmails = [...emailSet];
+                if (targetEmails.length === 0) {
+                    return sendJson(res, 400, { error: 'Nessun destinatario valido trovato tra gli utenti.' });
+                }
+                targetSummary = `all:${targetEmails.length}`;
+            }
+
+            const finalHtml = ensureRequiredEmailFooter(composedHtml);
+            const resendResults = [];
+
+            for (const emailAddr of targetEmails) {
+                const resendRes = await sendViaResend({
+                    to: emailAddr,
+                    subject,
+                    html: finalHtml,
+                    attachment
+                });
+                resendResults.push({
+                    email: emailAddr,
+                    resendId: resendRes?.id || null
+                });
+            }
+
+            const auditRef = db.collection('email_audit_logs').doc();
+            const auditTimestamp = new Date().toISOString();
+            const contentDigest = crypto
+                .createHash('sha256')
+                .update(`${subject}\n${finalHtml}\n${targetEmails.join(',')}`)
+                .digest('hex');
+
+            const auditSignature = signEmailAudit({
+                auditId: auditRef.id,
+                adminUid: adminUser.uid,
+                templateKey,
+                subject,
+                targetSummary,
+                count: targetEmails.length,
+                contentDigest,
+                timestamp: auditTimestamp
+            });
+
+            await auditRef.set({
+                id: auditRef.id,
+                templateKey,
+                subject,
+                recipientMode,
+                recipientUid: recipientMode === 'single' ? recipientUid : null,
+                recipientsCount: targetEmails.length,
+                hasAttachment: Boolean(attachment?.filename),
+                attachmentName: attachment?.filename ? cleanString(attachment.filename, 180) : null,
+                contentDigest,
+                resendResults,
+                auditSignature,
+                auditTimestamp,
+                sentBy: adminUser.uid,
+                createdAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            return sendJson(res, 200, {
+                success: true,
+                sentCount: targetEmails.length,
+                auditId: auditRef.id,
+                results: resendResults
+            });
+        }
+
+        return sendJson(res, 400, { error: 'Azione non riconosciuta' });
     } catch (error) {
-        console.error('Admin API error:', error);
+        if (!error.status) {
+            console.error('[admin-handler] Unhandled error:', error);
+        }
         return sendJson(res, error.status || 500, {
             error: error.status ? error.message : 'Errore interno del server'
         });
